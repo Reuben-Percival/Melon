@@ -34,6 +34,18 @@ If your global Zig cache path is not writable:
 ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache zig build
 ```
 
+## Install
+
+```bash
+./install.sh
+```
+
+## Uninstall
+
+```bash
+./uninstall.sh
+```
+
 ## Run
 
 ```bash
