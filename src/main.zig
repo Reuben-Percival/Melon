@@ -67,6 +67,8 @@ const InstallContext = struct {
     reviewed_aur: std.StringHashMap(void),
     aur_info_cache: std.StringHashMap([]u8),
     aur_pkgbuild_diffs: std.StringHashMap([]u8),
+    pending_pkg_paths: std.ArrayListUnmanaged([]u8),
+    local_repo_dir: ?[]u8,
     skip_remaining_reviews: bool,
 
     fn init(allocator: Allocator, config: RunConfig) InstallContext {
@@ -78,6 +80,8 @@ const InstallContext = struct {
             .reviewed_aur = std.StringHashMap(void).init(allocator),
             .aur_info_cache = std.StringHashMap([]u8).init(allocator),
             .aur_pkgbuild_diffs = std.StringHashMap([]u8).init(allocator),
+            .pending_pkg_paths = .{},
+            .local_repo_dir = null,
             .skip_remaining_reviews = false,
         };
     }
@@ -88,6 +92,9 @@ const InstallContext = struct {
         freeStringSetKeys(self.allocator, &self.reviewed_aur);
         freeStringToOwnedSliceMap(self.allocator, &self.aur_info_cache);
         freeStringToOwnedSliceMap(self.allocator, &self.aur_pkgbuild_diffs);
+        for (self.pending_pkg_paths.items) |path| self.allocator.free(path);
+        self.pending_pkg_paths.deinit(self.allocator);
+        if (self.local_repo_dir) |p| self.allocator.free(p);
         self.installed_aur.deinit();
         self.visiting_aur.deinit();
         self.reviewed_aur.deinit();
@@ -148,7 +155,7 @@ pub fn main() !void {
     const cmd = parsed.args[0];
     if (eql(cmd, "-Ss")) {
         if (parsed.args.len < 2) return usageErr("missing search query");
-        searchPackages(allocator, parsed.args[1]) catch |err| {
+        searchPackages(allocator, parsed.config, parsed.args[1]) catch |err| {
             printFailureReport(err);
             return err;
         };
@@ -210,7 +217,7 @@ pub fn main() !void {
     }
 
     if (parsed.args[0].len > 0 and parsed.args[0][0] == '-') {
-        try pacmanPassthrough(allocator, parsed.args);
+        try pacmanPassthrough(allocator, parsed.config, parsed.args);
         return;
     }
 
@@ -239,6 +246,22 @@ fn printUsage() void {
         \\    --cache-info             Show melon cache size/details
         \\    --cache-clean            Remove melon cache data
         \\    --resume-failed          Retry last failed package set
+        \\    --[no]pgpfetch           Prompt to import PGP keys from PKGBUILDs
+        \\    --[no]useask             Automatically resolve conflicts using pacman's ask flag
+        \\    --[no]savechanges        Commit changes to PKGBUILDs made during review
+        \\    --[no]newsonupgrade      Print new news during sysupgrade
+        \\    --[no]combinedupgrade    Refresh then perform repo and AUR upgrade together
+        \\    --[no]batchinstall       Build multiple AUR packages then install together
+        \\    --[no]provides           Look for matching providers when searching packages
+        \\    --[no]devel              Check development packages during sysupgrade
+        \\    --[no]installdebug       Also install debug packages when available
+        \\    --[no]sudoloop           Loop sudo calls in the background to avoid timeout
+        \\    --[no]chroot             Build packages in a chroot
+        \\    --[no]failfast           Exit as soon as building an AUR package fails
+        \\    --[no]keepsrc            Keep src/ and pkg/ dirs after building packages
+        \\    --[no]sign               Sign packages with gpg
+        \\    --[no]signdb             Sign databases with gpg
+        \\    --[no]localrepo          Build packages into a local repo
         \\    melon -h | --help        Show help
         \\
     , .{});
@@ -318,9 +341,12 @@ fn installWithCompatibility(allocator: Allocator, config: RunConfig, raw_args: [
     for (aur_targets, 0..) |pkg, idx| {
         progressLine("aur target", pkg, idx + 1, aur_targets.len);
         warnLineFmt("using AUR for: {s}", .{pkg});
-        installAurPackageRecursive(allocator, &ctx, pkg, true) catch |err| {
+        installAurPackageRecursive(allocator, &ctx, pkg, true, false) catch |err| {
             recordFailedPackage(allocator, pkg) catch {};
-            return err;
+            if (config.failfast) return err;
+            g_run_summary.failures += 1;
+            printFailureReport(err);
+            continue;
         };
         okLineFmt("AUR install complete: {s}", .{pkg});
     }
@@ -329,13 +355,17 @@ fn installWithCompatibility(allocator: Allocator, config: RunConfig, raw_args: [
         for (official_targets, 0..) |pkg, idx| {
             progressLine("aur fallback", pkg, idx + 1, official_targets.len);
             warnLineFmt("repo unavailable, trying AUR for: {s}", .{pkg});
-            installAurPackageRecursive(allocator, &ctx, pkg, true) catch |err| {
+            installAurPackageRecursive(allocator, &ctx, pkg, true, false) catch |err| {
                 recordFailedPackage(allocator, pkg) catch {};
-                return err;
+                if (config.failfast) return err;
+                g_run_summary.failures += 1;
+                printFailureReport(err);
+                continue;
             };
             okLineFmt("AUR fallback install complete: {s}", .{pkg});
         }
     }
+    try flushPendingBatchInstalls(allocator, &ctx);
     phaseLine("complete", 4, 4);
 
     if (config.json) {
@@ -365,9 +395,10 @@ fn installOfficialTargets(allocator: Allocator, config: RunConfig, options: []co
         setFailureContext("repo install", "pacman", "sudo pacman -S ...", "Check pacman output and rerun");
         return error.PacmanInstallFailed;
     }
+    if (config.installdebug) try installDebugCompanions(allocator, config, targets);
 }
 
-fn searchPackages(allocator: Allocator, query: []const u8) !void {
+fn searchPackages(allocator: Allocator, config: RunConfig, query: []const u8) !void {
     title("Search");
     kv("query", query);
     rule();
@@ -423,6 +454,28 @@ fn searchPackages(allocator: Allocator, query: []const u8) !void {
         rule();
         kvInt("aur results", shown);
     }
+
+    if (!config.provides or g_json_output) return;
+    section("AUR providers");
+    const providers_url = try std.fmt.allocPrint(allocator, "https://aur.archlinux.org/rpc/v5/search/{s}?by=provides", .{enc});
+    defer allocator.free(providers_url);
+    const providers_body = try fetchUrl(allocator, providers_url);
+    defer allocator.free(providers_body);
+    const providers_parsed = try std.json.parseFromSlice(std.json.Value, allocator, providers_body, .{});
+    defer providers_parsed.deinit();
+    const providers_results = getArray(providers_parsed.value, "results") orelse return;
+    if (providers_results.items.len == 0) {
+        warnLine("no provider matches");
+        return;
+    }
+    for (providers_results.items) |entry| {
+        if (entry != .object) continue;
+        const name = getString(entry, "Name") orelse "<unknown>";
+        const version = getString(entry, "Version") orelse "<unknown>";
+        const desc = getString(entry, "Description") orelse "";
+        std.debug.print("{s}provider{s} aur/{s} {s}\n", .{ color_title, color_reset, name, version });
+        if (desc.len > 0) std.debug.print("  {s}{s}{s}\n", .{ color_dim, desc, color_reset });
+    }
 }
 
 fn infoPackage(allocator: Allocator, pkg: []const u8) !void {
@@ -470,12 +523,14 @@ fn infoPackage(allocator: Allocator, pkg: []const u8) !void {
 fn systemUpgrade(allocator: Allocator, config: RunConfig) !void {
     title("Upgrade");
     try clearFailedPackages(allocator);
+    if (config.newsonupgrade) try showArchNews(allocator);
     phaseLine("system sync", 1, 3);
     section("system packages");
     const sync_rc = try runPacmanSudoMaybe(allocator, config, &.{"-Syu"});
     if (sync_rc != 0) {
         recordFailedPackage(allocator, "__system_upgrade__") catch {};
         setFailureContext("system upgrade", "__system_upgrade__", "sudo pacman -Syu", "Resolve pacman sync issues, then rerun");
+        if (config.combinedupgrade) return error.PacmanInstallFailed;
         warnLine("system repo upgrade failed; continuing with AUR upgrade best-effort mode");
         g_run_summary.failures += 1;
     } else {
@@ -530,7 +585,7 @@ fn aurUpgrade(allocator: Allocator, config: RunConfig) !void {
         defer allocator.free(installed);
 
         const cmp = try vercmp(allocator, installed, latest);
-        if (cmp < 0) {
+        if (cmp < 0 or (config.devel and isDevelPackageName(pkg))) {
             if (seen_bases.contains(base)) continue;
             try seen_bases.put(try allocator.dupe(u8, base), {});
 
@@ -538,14 +593,18 @@ fn aurUpgrade(allocator: Allocator, config: RunConfig) !void {
             kv("package", pkg);
             kv("current", installed);
             kv("latest", latest);
-            installAurPackageRecursive(allocator, &ctx, base, false) catch |err| {
+            installAurPackageRecursive(allocator, &ctx, base, false, false) catch |err| {
                 recordFailedPackage(allocator, base) catch {};
-                return err;
+                if (config.failfast) return err;
+                g_run_summary.failures += 1;
+                printFailureReport(err);
+                continue;
             };
             upgraded += 1;
             g_run_summary.aur_upgraded += 1;
         }
     }
+    try flushPendingBatchInstalls(allocator, &ctx);
     phaseLine("complete", 3, 3);
 
     if (config.json) {
@@ -581,7 +640,7 @@ fn foreignPackages(allocator: Allocator) !void {
     std.debug.print("]}}\n", .{});
 }
 
-fn installAurPackageRecursive(allocator: Allocator, ctx: *InstallContext, pkg: []const u8, skip_if_installed: bool) anyerror!void {
+fn installAurPackageRecursive(allocator: Allocator, ctx: *InstallContext, pkg: []const u8, skip_if_installed: bool, is_dependency: bool) anyerror!void {
     if (skip_if_installed and (try isInstalledPackage(allocator, pkg))) return;
 
     const repo_base = (try resolveAurPackageBaseCached(allocator, ctx, pkg)) orelse {
@@ -621,7 +680,8 @@ fn installAurPackageRecursive(allocator: Allocator, ctx: *InstallContext, pkg: [
 
     const build_dir = try createSecureBuildDir(allocator, repo_base);
     defer allocator.free(build_dir);
-    defer std.fs.deleteTreeAbsolute(build_dir) catch {};
+    const keep_build_dir = ctx.config.keepsrc or ctx.config.savechanges;
+    defer if (!keep_build_dir) std.fs.deleteTreeAbsolute(build_dir) catch {};
     try std.fs.makeDirAbsolute(build_dir);
     const repo_contents_path = try std.fmt.allocPrint(allocator, "{s}/.", .{repo_sync.repo_dir});
     defer allocator.free(repo_contents_path);
@@ -631,21 +691,45 @@ fn installAurPackageRecursive(allocator: Allocator, ctx: *InstallContext, pkg: [
         return error.AurCloneFailed;
     }
 
-    const srcinfo = try generateSrcinfo(allocator, build_dir, repo_base);
+    const srcinfo = try generateSrcinfo(allocator, ctx.config, build_dir, repo_base);
     defer allocator.free(srcinfo);
 
     try resolveAurDependencies(allocator, ctx, srcinfo);
     try reviewAurPackage(allocator, ctx, build_dir, pkg, repo_base, srcinfo, repo_sync.reviewed_from);
+    if (ctx.config.savechanges) try savePkgbuildReviewChanges(allocator, build_dir, repo_base);
 
-    const mk_rc = try runStreamingCwd(allocator, build_dir, &.{ "makepkg", "-si", "--noconfirm" });
-    if (mk_rc != 0) {
-        setFailureContext("aur build", repo_base, "makepkg -si --noconfirm", "Review PKGBUILD and rerun with --resume-failed");
-        return error.MakepkgFailed;
+    if (ctx.config.pgpfetch) {
+        const verify_rc = try runStreamingCwd(allocator, build_dir, &.{ "makepkg", "--verifysource" });
+        if (verify_rc != 0) {
+            setFailureContext("aur verify", repo_base, "makepkg --verifysource", "Import required keys and retry, or disable with --nopgpfetch");
+            return error.MakepkgFailed;
+        }
+    }
+
+    const use_noinstall = ctx.config.chroot or
+        ((ctx.config.localrepo or ctx.config.batchinstall) and !is_dependency);
+    const built_pkg_paths = try buildAurPackage(allocator, ctx.config, build_dir, repo_base, use_noinstall);
+    defer freeNameList(allocator, built_pkg_paths);
+
+    if (use_noinstall) {
+        if (built_pkg_paths.len == 0) {
+            setFailureContext("aur package discovery", repo_base, "find built package files", "Build produced no package artifacts");
+            return error.MakepkgFailed;
+        }
+        if (ctx.config.localrepo) try addPackagesToLocalRepo(allocator, ctx, built_pkg_paths);
+        if (ctx.config.batchinstall and !is_dependency) {
+            for (built_pkg_paths) |pkg_path| {
+                try ctx.pending_pkg_paths.append(allocator, try allocator.dupe(u8, pkg_path));
+            }
+        } else {
+            try installBuiltPackages(allocator, ctx.config, built_pkg_paths);
+        }
     }
 
     removeStringSetEntryAndFreeKey(ctx.allocator, &ctx.visiting_aur, repo_base);
     try ctx.installed_aur.put(try ctx.allocator.dupe(u8, repo_base), {});
     g_run_summary.aur_installed += 1;
+    if (keep_build_dir) warnLineFmt("keeping build dir: {s}", .{build_dir});
 }
 
 fn resolveAurDependencies(allocator: Allocator, ctx: *InstallContext, srcinfo: []const u8) anyerror!void {
@@ -671,14 +755,15 @@ fn ensureDependencyInstalled(allocator: Allocator, ctx: *InstallContext, dep: []
         const rc = try runPacmanSudoMaybe(allocator, ctx.config, &.{ "-S", "--needed", dep });
         if (rc != 0) {
             warnLineFmt("repo dependency install failed for {s}; trying AUR fallback", .{dep});
-            try installAurPackageRecursive(allocator, ctx, dep, true);
+            try installAurPackageRecursive(allocator, ctx, dep, true, true);
             return;
         }
+        if (ctx.config.installdebug) try installDebugCompanions(allocator, ctx.config, &.{dep});
         return;
     }
 
     sectionFmt("install dependency from AUR: {s}", .{dep});
-    try installAurPackageRecursive(allocator, ctx, dep, true);
+    try installAurPackageRecursive(allocator, ctx, dep, true, true);
 }
 
 fn reviewAurPackage(allocator: Allocator, ctx: *InstallContext, build_dir: []const u8, pkg: []const u8, repo_base: []const u8, srcinfo: []const u8, reviewed_from: ?[]const u8) !void {
@@ -1366,11 +1451,181 @@ fn createSecureBuildDir(allocator: Allocator, repo_base: []const u8) ![]u8 {
     return std.fmt.allocPrint(allocator, "/tmp/melon-{s}-{d}-{s}", .{ repo_base, now, random_hex[0..] });
 }
 
-fn generateSrcinfo(allocator: Allocator, build_dir: []const u8, pkg: []const u8) ![]u8 {
-    return runCaptureCwd(allocator, build_dir, &.{ "makepkg", "--printsrcinfo" }) catch |err| {
+fn generateSrcinfo(allocator: Allocator, config: RunConfig, build_dir: []const u8, pkg: []const u8) ![]u8 {
+    var args: std.ArrayListUnmanaged([]const u8) = .{};
+    defer args.deinit(allocator);
+    try args.append(allocator, "makepkg");
+    try args.append(allocator, "--printsrcinfo");
+    if (!config.pgpfetch) try args.append(allocator, "--skippgpcheck");
+    return runCaptureCwd(allocator, build_dir, args.items) catch |err| {
         errLineFmt("failed to generate .SRCINFO for aur/{s}: {s}", .{ pkg, @errorName(err) });
         return error.SrcInfoFailed;
     };
+}
+
+fn buildAurPackage(allocator: Allocator, config: RunConfig, build_dir: []const u8, repo_base: []const u8, noinstall: bool) ![]const []const u8 {
+    if (config.chroot) {
+        const have_chroot = (runStatus(allocator, null, &.{ "sh", "-lc", "command -v extra-x86_64-build >/dev/null 2>&1" }) catch 1) == 0;
+        if (!have_chroot) {
+            setFailureContext("aur build", repo_base, "extra-x86_64-build", "Install devtools or disable --chroot");
+            return error.MakepkgFailed;
+        }
+        const rc = try runStreamingCwd(allocator, build_dir, &.{"extra-x86_64-build"});
+        if (rc != 0) {
+            setFailureContext("aur chroot build", repo_base, "extra-x86_64-build", "Check devtools/chroot setup");
+            return error.MakepkgFailed;
+        }
+        return listBuiltPackageFiles(allocator, build_dir);
+    }
+
+    var args: std.ArrayListUnmanaged([]const u8) = .{};
+    defer args.deinit(allocator);
+    try args.append(allocator, "makepkg");
+    try args.append(allocator, "-s");
+    try args.append(allocator, "--noconfirm");
+    if (!config.pgpfetch) try args.append(allocator, "--skippgpcheck");
+    if (config.sign) try args.append(allocator, "--sign");
+    if (noinstall) {
+        try args.append(allocator, "--noinstall");
+    } else {
+        try args.append(allocator, "-i");
+    }
+    const mk_rc = try runStreamingCwd(allocator, build_dir, args.items);
+    if (mk_rc != 0) {
+        setFailureContext("aur build", repo_base, "makepkg -s ...", "Review PKGBUILD and rerun with --resume-failed");
+        return error.MakepkgFailed;
+    }
+    if (!noinstall) return allocator.alloc([]const u8, 0);
+    return listBuiltPackageFiles(allocator, build_dir);
+}
+
+fn listBuiltPackageFiles(allocator: Allocator, build_dir: []const u8) ![]const []const u8 {
+    var dir = try std.fs.openDirAbsolute(build_dir, .{ .iterate = true });
+    defer dir.close();
+    var it = dir.iterate();
+    var out: std.ArrayListUnmanaged([]const u8) = .{};
+    defer out.deinit(allocator);
+    while (try it.next()) |entry| {
+        if (entry.kind != .file) continue;
+        if (std.mem.indexOf(u8, entry.name, ".pkg.tar") == null) continue;
+        if (std.mem.endsWith(u8, entry.name, ".sig")) continue;
+        const full = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ build_dir, entry.name });
+        try out.append(allocator, full);
+    }
+    return out.toOwnedSlice(allocator);
+}
+
+fn installBuiltPackages(allocator: Allocator, config: RunConfig, pkg_paths: []const []const u8) !void {
+    if (pkg_paths.len == 0) return;
+    const args_len = 1 + pkg_paths.len;
+    var pac_args = try allocator.alloc([]const u8, args_len);
+    defer allocator.free(pac_args);
+    pac_args[0] = "-U";
+    @memcpy(pac_args[1..], pkg_paths);
+    const rc = try runPacmanSudoMaybe(allocator, config, pac_args);
+    if (rc != 0) return error.PacmanInstallFailed;
+}
+
+fn localRepoDir(allocator: Allocator, ctx: *InstallContext) ![]const u8 {
+    if (ctx.local_repo_dir) |p| return p;
+    const cache_root = try melonCacheRoot(allocator);
+    defer allocator.free(cache_root);
+    const repo_dir = try std.fmt.allocPrint(allocator, "{s}/localrepo", .{cache_root});
+    try std.fs.cwd().makePath(repo_dir);
+    ctx.local_repo_dir = repo_dir;
+    return repo_dir;
+}
+
+fn addPackagesToLocalRepo(allocator: Allocator, ctx: *InstallContext, pkg_paths: []const []const u8) !void {
+    if (pkg_paths.len == 0) return;
+    const repo_dir = try localRepoDir(allocator, ctx);
+    for (pkg_paths) |pkg_path| {
+        const cp_rc = try runStreaming(allocator, &.{ "cp", "-f", pkg_path, repo_dir });
+        if (cp_rc != 0) return error.CommandFailed;
+    }
+
+    var copied: std.ArrayListUnmanaged([]const u8) = .{};
+    defer {
+        for (copied.items) |p| allocator.free(p);
+        copied.deinit(allocator);
+    }
+    for (pkg_paths) |pkg_path| {
+        const name = std.fs.path.basename(pkg_path);
+        try copied.append(allocator, try std.fmt.allocPrint(allocator, "{s}/{s}", .{ repo_dir, name }));
+    }
+
+    const db = try std.fmt.allocPrint(allocator, "{s}/melon-local.db.tar.gz", .{repo_dir});
+    defer allocator.free(db);
+    const argc = 2 + (if (ctx.config.signdb) @as(usize, 1) else 0) + copied.items.len;
+    var repo_add_args = try allocator.alloc([]const u8, argc);
+    defer allocator.free(repo_add_args);
+    var i: usize = 0;
+    repo_add_args[i] = "repo-add";
+    i += 1;
+    if (ctx.config.signdb) {
+        repo_add_args[i] = "--sign";
+        i += 1;
+    }
+    repo_add_args[i] = db;
+    i += 1;
+    @memcpy(repo_add_args[i..], copied.items);
+    const rc = try runStreaming(allocator, repo_add_args);
+    if (rc != 0) return error.CommandFailed;
+}
+
+fn flushPendingBatchInstalls(allocator: Allocator, ctx: *InstallContext) !void {
+    if (!ctx.config.batchinstall or ctx.pending_pkg_paths.items.len == 0) return;
+    section("batch install");
+    try installBuiltPackages(allocator, ctx.config, ctx.pending_pkg_paths.items);
+    for (ctx.pending_pkg_paths.items) |path| allocator.free(path);
+    ctx.pending_pkg_paths.clearRetainingCapacity();
+}
+
+fn savePkgbuildReviewChanges(allocator: Allocator, build_dir: []const u8, repo_base: []const u8) !void {
+    const dirty_rc = runStatus(allocator, build_dir, &.{ "git", "diff", "--quiet", "--", "PKGBUILD", ".SRCINFO" }) catch 0;
+    if (dirty_rc == 0) return;
+    _ = try runStreamingCwd(allocator, build_dir, &.{ "git", "add", "--", "PKGBUILD", ".SRCINFO" });
+    const msg = try std.fmt.allocPrint(allocator, "melon: save review changes for {s}", .{repo_base});
+    defer allocator.free(msg);
+    const commit_rc = try runStreamingCwd(allocator, build_dir, &.{ "git", "-c", "user.name=melon", "-c", "user.email=melon@localhost", "commit", "-m", msg });
+    if (commit_rc != 0) warnLine("savechanges enabled but no commit was created");
+}
+
+fn installDebugCompanions(allocator: Allocator, config: RunConfig, packages: []const []const u8) !void {
+    for (packages) |pkg| {
+        const debug_name = try std.fmt.allocPrint(allocator, "{s}-debug", .{pkg});
+        defer allocator.free(debug_name);
+        if (!try isOfficialPackage(allocator, debug_name)) continue;
+        _ = try runPacmanSudoMaybe(allocator, config, &.{ "-S", "--needed", debug_name });
+    }
+}
+
+fn isDevelPackageName(pkg: []const u8) bool {
+    return std.mem.endsWith(u8, pkg, "-git") or
+        std.mem.endsWith(u8, pkg, "-svn") or
+        std.mem.endsWith(u8, pkg, "-hg") or
+        std.mem.endsWith(u8, pkg, "-bzr") or
+        std.mem.endsWith(u8, pkg, "-darcs");
+}
+
+fn showArchNews(allocator: Allocator) !void {
+    section("arch news");
+    const body = fetchUrl(allocator, "https://archlinux.org/feeds/news/") catch {
+        warnLine("failed to fetch arch news");
+        return;
+    };
+    defer allocator.free(body);
+    var it = std.mem.splitSequence(u8, body, "<item>");
+    _ = it.next();
+    var count: usize = 0;
+    while (it.next()) |item| {
+        if (count >= 5) break;
+        const title_start = std.mem.indexOf(u8, item, "<title>") orelse continue;
+        const title_end = std.mem.indexOf(u8, item, "</title>") orelse continue;
+        const t = item[title_start + "<title>".len .. title_end];
+        std.debug.print("  - {s}\n", .{std.mem.trim(u8, t, " \t\r\n")});
+        count += 1;
+    }
 }
 
 fn isInstalledPackage(allocator: Allocator, pkg: []const u8) !bool {
@@ -1383,9 +1638,9 @@ fn isOfficialPackage(allocator: Allocator, pkg: []const u8) !bool {
     return rc == 0;
 }
 
-fn pacmanPassthrough(allocator: Allocator, pacman_args: []const []const u8) !void {
+fn pacmanPassthrough(allocator: Allocator, config: RunConfig, pacman_args: []const []const u8) !void {
     const rc = if (needsRootPacman(pacman_args))
-        try runPacmanSudo(allocator, pacman_args)
+        try runPacmanSudoMaybe(allocator, config, pacman_args)
     else
         try runPacman(allocator, pacman_args);
     if (rc != 0) return error.PacmanPassthroughFailed;
@@ -1434,11 +1689,33 @@ fn runPacmanSudo(allocator: Allocator, pacman_args: []const []const u8) !u8 {
 }
 
 fn runPacmanSudoMaybe(allocator: Allocator, config: RunConfig, pacman_args: []const []const u8) !u8 {
+    const effective = try withPacmanAskOption(allocator, config, pacman_args);
+    defer allocator.free(effective);
     if (config.dry_run) {
-        printDryRunCommand("sudo pacman", pacman_args);
+        printDryRunCommand("sudo pacman", effective);
         return 0;
     }
-    return runPacmanSudo(allocator, pacman_args);
+    if (config.sudoloop) _ = runStreaming(allocator, &.{ "sudo", "-v" }) catch 1;
+    return runPacmanSudo(allocator, effective);
+}
+
+fn withPacmanAskOption(allocator: Allocator, config: RunConfig, pacman_args: []const []const u8) ![]const []const u8 {
+    if (!config.useask or hasPacmanAskArg(pacman_args)) {
+        const out = try allocator.alloc([]const u8, pacman_args.len);
+        @memcpy(out, pacman_args);
+        return out;
+    }
+    const out = try allocator.alloc([]const u8, pacman_args.len + 1);
+    @memcpy(out[0..pacman_args.len], pacman_args);
+    out[pacman_args.len] = "--ask=4";
+    return out;
+}
+
+fn hasPacmanAskArg(args: []const []const u8) bool {
+    for (args) |arg| {
+        if (eql(arg, "--ask") or std.mem.startsWith(u8, arg, "--ask=")) return true;
+    }
+    return false;
 }
 
 fn runStreamingRetry(allocator: Allocator, argv: []const []const u8, max_attempts: usize, initial_delay_ms: u64) !u8 {

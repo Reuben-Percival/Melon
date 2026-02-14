@@ -20,6 +20,7 @@
 
 ## Runtime options
 
+- `-h`, `--help`: show command and flag help.
 - `--dry-run`: print mutating actions without executing them.
 - `--json`: machine-readable summaries for key flows.
 - `--assume-reviewed`: skip interactive review prompts.
@@ -27,6 +28,22 @@
 - `--cache-info`: show cache location/size.
 - `--cache-clean`: clear melon cache state.
 - `--resume-failed`: retry last failed package set.
+- `--[no]pgpfetch`: prompt to import PGP keys from PKGBUILDs.
+- `--[no]useask`: automatically resolve conflicts using pacman's ask flag.
+- `--[no]savechanges`: commit changes to PKGBUILDs made during review.
+- `--[no]newsonupgrade`: print new news during sysupgrade.
+- `--[no]combinedupgrade`: refresh then perform the repo and AUR upgrade together.
+- `--[no]batchinstall`: build multiple AUR packages then install them together.
+- `--[no]provides`: look for matching providers when searching for packages.
+- `--[no]devel`: check development packages during sysupgrade.
+- `--[no]installdebug`: also install debug packages when a package provides them.
+- `--[no]sudoloop`: loop sudo calls in the background to avoid timeout.
+- `--[no]chroot`: build packages in a chroot.
+- `--[no]failfast`: exit as soon as building an AUR package fails.
+- `--[no]keepsrc`: keep `src/` and `pkg/` dirs after building packages.
+- `--[no]sign`: sign packages with gpg.
+- `--[no]signdb`: sign databases with gpg.
+- `--[no]localrepo`: build packages into a local repo.
 
 ## AUR review flow
 
