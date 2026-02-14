@@ -147,7 +147,7 @@ pub fn main() !void {
     }
     if (parsed.config.assume_reviewed and
         !parsed.config.i_know_what_im_doing and
-        !std.fs.File.stdin().isTty())
+        !stdinIsTty())
     {
         return usageErr("non-interactive --assume-reviewed requires --i-know-what-im-doing");
     }
@@ -1718,13 +1718,35 @@ fn hasPacmanAskArg(args: []const []const u8) bool {
     return false;
 }
 
+fn stdinIsTty() bool {
+    if (@hasDecl(std.fs.File, "stdin")) return std.fs.File.stdin().isTty();
+    if (@hasDecl(std, "io")) {
+        if (@hasDecl(std.io, "getStdIn")) return std.io.getStdIn().isTty();
+    }
+    if (@hasDecl(std, "Io")) {
+        if (@hasDecl(std.Io, "getStdIn")) return std.Io.getStdIn().isTty();
+    }
+    return true;
+}
+
+fn sleepNs(ns: u64) void {
+    if (@hasDecl(std.Thread, "sleep")) {
+        std.Thread.sleep(ns);
+        return;
+    }
+    if (@hasDecl(std.time, "sleep")) {
+        std.time.sleep(ns);
+        return;
+    }
+}
+
 fn runStreamingRetry(allocator: Allocator, argv: []const []const u8, max_attempts: usize, initial_delay_ms: u64) !u8 {
     var attempt: usize = 0;
     var delay = initial_delay_ms;
     while (attempt < max_attempts) : (attempt += 1) {
         const rc = runStreaming(allocator, argv) catch 1;
         if (rc == 0) return 0;
-        if (attempt + 1 < max_attempts) std.Thread.sleep(delay * std.time.ns_per_ms);
+        if (attempt + 1 < max_attempts) sleepNs(delay * std.time.ns_per_ms);
         delay *= 2;
     }
     return 1;
@@ -1736,7 +1758,7 @@ fn runCaptureRetry(allocator: Allocator, argv: []const []const u8, max_attempts:
     while (attempt < max_attempts) : (attempt += 1) {
         const out = runCapture(allocator, argv) catch null;
         if (out) |data| return data;
-        if (attempt + 1 < max_attempts) std.Thread.sleep(delay * std.time.ns_per_ms);
+        if (attempt + 1 < max_attempts) sleepNs(delay * std.time.ns_per_ms);
         delay *= 2;
     }
     return error.CommandFailed;
