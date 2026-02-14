@@ -50,6 +50,7 @@ This file tracks parity work between `melon` and `paru`.
 
 ## Maintenance
 
+- [x] Zig build script compatibility across Zig 0.13 and newer
 - [ ] Integration tests with mocked pacman/AUR backends
 - [ ] Packaging variants (`melon`, `melon-git`)
 - [ ] Release automation and signed artifacts
