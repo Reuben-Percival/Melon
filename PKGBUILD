@@ -1,28 +1,33 @@
 pkgname=melon
-pkgver=0.1.0
+pkgver=r0.0a1b2c3
 pkgrel=1
 pkgdesc="Minimal AUR helper written in Zig with mandatory PKGBUILD review"
 arch=('x86_64')
 url="https://github.com/Reuben-Percival/Melon"
-license=('MIT')
+license=('Gplv2')
 depends=('pacman' 'curl' 'git' 'sudo')
 makedepends=('zig')
 provides=('melon')
 conflicts=('melon-git')
-source=("$pkgname-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz")
+source=("git+$url.git")
 sha256sums=('SKIP')
 
+pkgver() {
+  cd "$srcdir/Melon"
+  printf "r%s.%s" "$(git rev-list --count HEAD)" "$(git rev-parse --short HEAD)"
+}
+
 build() {
-  cd "$srcdir/Melon-$pkgver"
+  cd "$srcdir/Melon"
   zig build -Doptimize=ReleaseSafe
 }
 
 check() {
-  cd "$srcdir/Melon-$pkgver"
-  zig build
+  cd "$srcdir/Melon"
+  zig build test
 }
 
 package() {
-  cd "$srcdir/Melon-$pkgver"
-  install -Dm755 "zig-out/bin/melon" "$pkgdir/usr/bin/melon"
+  cd "$srcdir/Melon"
+  NO_SUDO=1 SKIP_BUILD=1 PREFIX="$pkgdir/usr" BIN_NAME="melon" ./install.sh
 }

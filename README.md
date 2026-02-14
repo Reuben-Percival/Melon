@@ -1,75 +1,121 @@
 # melon
 
-`melon` is an AUR helper written in Zig.
+`melon` is a Zig-based AUR helper for Arch Linux focused on explicit review, resilient upgrades, and clear terminal UX.
 
-## Features
+## Project status
 
-- `-Ss <query>`: search official repos (`pacman -Ss`) and AUR (RPC).
-- `-Si <package>`: package info from official repos, then AUR fallback.
-- `-S <pkg...>`: install from official repos, then fallback to AUR via `git clone` + `makepkg -si`.
-- `-S [options] <targets...>`: pacman-compatible `-S` parsing (options + targets). Official targets are installed in one pacman transaction; unresolved targets are handled via AUR.
-- `-Syu`: run full system upgrade and then upgrade installed AUR packages.
-- `-Sua`: upgrade only installed AUR/foreign packages.
-- `-Qm`: list foreign packages (same as `pacman -Qm`).
-- `melon <pacman flags...>`: passthrough for pacman operations not explicitly overridden.
-- Recursive AUR dependency resolution for `depends`, `makedepends`, and `checkdepends`.
-- Faster internal checks (quiet package detection, dependency satisfaction via `pacman -T`, shallow AUR clones).
-- Cleaner styled output with sections, status markers, and colored summaries.
-- Mandatory AUR review gates:
-  - Before each AUR build, an interactive review menu lets you:
-    - view `PKGBUILD`
-    - view dependency summary
-    - view full `.SRCINFO`
-    - continue, continue-and-trust-remaining for this run, or abort
+- Active development.
+- Current packaging model: rolling git source (`PKGBUILD` builds from `https://github.com/Reuben-Percival/Melon.git`).
+- `pkgver` is derived from git revision count + commit hash (`r<rev>.<hash>`).
 
-## Build
+## Core commands
+
+- `melon -Ss <query>`: search official repos and AUR.
+- `melon -Si <package>`: package info (repo first, AUR fallback).
+- `melon -S [options] <targets...>`: install targets (repo first, AUR fallback).
+- `melon -Syu`: full system upgrade + AUR upgrades (best-effort AUR continuation if repo sync fails).
+- `melon -Sua`: upgrade only installed AUR/foreign packages.
+- `melon -Qm`: list foreign packages.
+- `melon <pacman flags...>`: passthrough for non-overridden pacman operations.
+
+## Runtime options
+
+- `--dry-run`: print mutating actions without executing them.
+- `--json`: machine-readable summaries for key flows.
+- `--assume-reviewed`: skip interactive review prompts.
+- `--i-know-what-im-doing`: required with `--assume-reviewed` in non-interactive runs.
+- `--cache-info`: show cache location/size.
+- `--cache-clean`: clear melon cache state.
+- `--resume-failed`: retry last failed package set.
+
+## AUR review flow
+
+Before each AUR build, melon requires a review step (unless explicitly bypassed):
+
+- `1` View raw `PKGBUILD` (classic pager view).
+- `2` View dependency summary.
+- `3` View full `.SRCINFO`.
+- `4` View `PKGBUILD` diff since last reviewed commit (when available).
+- `5` Run PKGBUILD security check (capability/risk summary).
+- `c` Continue build.
+- `a` Continue and trust remaining builds for this run.
+- `q` Abort.
+
+Security check (`5`) is required before `c`/`a` for that review prompt.
+
+## Resilience and safety behavior
+
+- Recursive AUR dependency resolution (`depends`, `makedepends`, `checkdepends`).
+- Best-effort fallback when official repo operations fail:
+  - `-S`: attempts AUR fallback for requested targets.
+  - dependency installs: tries AUR if repo dependency install fails.
+  - `-Syu`: continues to AUR phase even if repo sync fails.
+- Retry/backoff for AUR RPC (`curl`) and AUR git sync (`clone`/`fetch`).
+- Persistent cache:
+  - AUR info cache
+  - AUR git repo cache
+  - reviewed commit snapshots
+  - failed package set tracking
+- Structured failure report with step/package/command/hint.
+
+## UX output
+
+- Phase/progress lines for install/upgrade flow.
+- End-of-run summary card:
+  - official/AUR targets
+  - AUR installed/upgraded
+  - failures
+  - cache hits/misses
+  - elapsed time
+
+## Build and test
 
 ```bash
 zig build
+zig build test
 ```
 
-If your global Zig cache path is not writable:
+If Zig global cache is not writable:
 
 ```bash
 ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache zig build
+ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache zig build test
 ```
 
-## Install
-
-```bash
-./install.sh
-```
-
-## Uninstall
-
-```bash
-./uninstall.sh
-```
-
-## Run
+## Quick run examples
 
 ```bash
 zig build run -- -Ss neovim
-zig build run -- -Si yay
-zig build run -- -S paru
+zig build run -- -Si paru
+zig build run -- -S rustfetch-git
 zig build run -- -S --needed --noconfirm ripgrep paru
 zig build run -- -Syu
 zig build run -- -Sua
 zig build run -- -Qm
-zig build run -- -Rns somepkg
+zig build run -- --dry-run -Syu
+zig build run -- --json -Sua
+zig build run -- --cache-info
+zig build run -- --resume-failed
 ```
 
 ## Runtime dependencies
 
 - `pacman`
-- `sudo` (for official repo installs)
+- `sudo` (for repo installs/upgrades)
 - `curl`
 - `git`
 - `makepkg`
-- `vercmp` (from `pacman`)
+- `vercmp` (from pacman)
 
-## Packaging
+## Source layout
 
-A `PKGBUILD` for `melon` is included in this repo.
+- `src/main.zig`: orchestration, review flow, UX/reporting.
+- `src/parsing.zig`: CLI/dependency parsing.
+- `src/process.zig`: process execution helpers.
+- `src/ui.zig`: terminal UI helpers.
 
-Release packaging expects tags in the form `v<version>` (example: `v0.1.0`).
+## Packaging and release
+
+- `PKGBUILD` is included in repo and builds from git source.
+- CI runs `zig build` and `zig build test`.
+- Tagged releases (`v*`) publish Linux x86_64 binary artifacts.
