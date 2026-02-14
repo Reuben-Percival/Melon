@@ -2,11 +2,14 @@ const std = @import("std");
 const parsing = @import("parsing.zig");
 const process = @import("process.zig");
 const ui = @import("ui.zig");
+const reporting = @import("reporting.zig");
 
 const Allocator = std.mem.Allocator;
 const RunConfig = parsing.RunConfig;
 const ParsedCli = parsing.ParsedCli;
 const SplitInstallArgs = parsing.SplitInstallArgs;
+const RunSummary = reporting.RunSummary;
+const FailureInfo = reporting.FailureInfo;
 const parseCliArgs = parsing.parseCliArgs;
 const splitInstallArgs = parsing.splitInstallArgs;
 const dependencyBaseName = parsing.dependencyBaseName;
@@ -21,43 +24,24 @@ const runStatus = process.runStatus;
 const runCapture = process.runCapture;
 const runCaptureCwd = process.runCaptureCwd;
 
-const color_reset = "\x1b[0m";
-const color_title = "\x1b[1;36m";
-const color_ok = "\x1b[1;32m";
-const color_warn = "\x1b[1;33m";
-const color_err = "\x1b[1;31m";
-const color_dim = "\x1b[2m";
+const melon_version = "0.3.0";
+
+var color_reset: []const u8 = "\x1b[0m";
+var color_title: []const u8 = "\x1b[1;36m";
+var color_ok: []const u8 = "\x1b[1;32m";
+var color_warn: []const u8 = "\x1b[1;33m";
+var color_err: []const u8 = "\x1b[1;31m";
+var color_dim: []const u8 = "\x1b[2m";
 const aur_info_cache_ttl_secs: i64 = 10 * 60;
 const default_prefetch_jobs: usize = 4;
 const network_retry_max_attempts: usize = 3;
 const network_retry_initial_delay_ms: u64 = 250;
+const sudoloop_interval_ns: u64 = 5 * 60 * std.time.ns_per_s;
 
 var g_json_output: bool = false;
 var g_run_summary = RunSummary{};
 var g_failure: ?FailureInfo = null;
-
-const RunSummary = struct {
-    started_ns: i128 = 0,
-    official_targets: usize = 0,
-    aur_targets: usize = 0,
-    aur_installed: usize = 0,
-    aur_upgraded: usize = 0,
-    failures: usize = 0,
-    cache_hits: usize = 0,
-    cache_misses: usize = 0,
-
-    fn begin(self: *RunSummary) void {
-        self.* = .{ .started_ns = std.time.nanoTimestamp() };
-        g_failure = null;
-    }
-};
-
-const FailureInfo = struct {
-    step: []const u8,
-    package: []const u8,
-    command: []const u8,
-    hint: []const u8,
-};
+var g_sudoloop_running: bool = false;
 
 const InstallContext = struct {
     allocator: Allocator,
@@ -103,6 +87,10 @@ const InstallContext = struct {
     }
 };
 
+fn beginRun() void {
+    reporting.beginRun(&g_run_summary, &g_failure);
+}
+
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
@@ -114,6 +102,15 @@ pub fn main() !void {
     const parsed = try parseCliArgs(allocator, args[1..]);
     defer allocator.free(parsed.args);
     g_json_output = parsed.config.json;
+
+    // Color mode detection: NO_COLOR env, --color flag, pipe detection
+    initColorMode(allocator, parsed.config);
+
+    // --version
+    if (parsed.config.version) {
+        std.debug.print("melon {s}\n", .{melon_version});
+        return;
+    }
 
     if (parsed.config.cache_info) {
         cacheInfo(allocator, parsed.config) catch |err| {
@@ -130,7 +127,8 @@ pub fn main() !void {
         return;
     }
     if (parsed.config.resume_failed) {
-        g_run_summary.begin();
+        beginRun();
+        startSudoLoop(allocator, parsed.config);
         resumeFailed(allocator, parsed.config) catch |err| {
             g_run_summary.failures += 1;
             printFailureReport(err);
@@ -153,6 +151,8 @@ pub fn main() !void {
     }
 
     const cmd = parsed.args[0];
+
+    // -Ss: search
     if (eql(cmd, "-Ss")) {
         if (parsed.args.len < 2) return usageErr("missing search query");
         searchPackages(allocator, parsed.config, parsed.args[1]) catch |err| {
@@ -162,6 +162,14 @@ pub fn main() !void {
         return;
     }
 
+    // -Qs: local search
+    if (eql(cmd, "-Qs")) {
+        if (parsed.args.len < 2) return usageErr("missing search query");
+        try pacmanPassthrough(allocator, parsed.config, parsed.args);
+        return;
+    }
+
+    // -Si: info
     if (eql(cmd, "-Si")) {
         if (parsed.args.len < 2) return usageErr("missing package name");
         infoPackage(allocator, parsed.args[1]) catch |err| {
@@ -171,9 +179,42 @@ pub fn main() !void {
         return;
     }
 
+    // -G: clone AUR repo
+    if (eql(cmd, "-G")) {
+        if (parsed.args.len < 2) return usageErr("missing package name");
+        for (parsed.args[1..]) |pkg| {
+            cloneAurRepo(allocator, pkg) catch |err| {
+                printFailureReport(err);
+                if (parsed.config.failfast) return err;
+                continue;
+            };
+        }
+        return;
+    }
+
+    // -Sc: clean pacman cache + melon aur-info cache
+    if (eql(cmd, "-Sc")) {
+        cleanCacheLight(allocator, parsed.config) catch |err| {
+            printFailureReport(err);
+            return err;
+        };
+        return;
+    }
+
+    // -Scc: deep cache clean (pacman + all melon cache)
+    if (eql(cmd, "-Scc")) {
+        cleanCacheDeep(allocator, parsed.config) catch |err| {
+            printFailureReport(err);
+            return err;
+        };
+        return;
+    }
+
+    // -S: install
     if (eql(cmd, "-S")) {
         if (parsed.args.len < 2) return usageErr("missing package name(s)");
-        g_run_summary.begin();
+        beginRun();
+        startSudoLoop(allocator, parsed.config);
         installWithCompatibility(allocator, parsed.config, parsed.args[1..]) catch |err| {
             g_run_summary.failures += 1;
             printFailureReport(err);
@@ -184,8 +225,10 @@ pub fn main() !void {
         return;
     }
 
+    // -Syu: full upgrade
     if (eql(cmd, "-Syu")) {
-        g_run_summary.begin();
+        beginRun();
+        startSudoLoop(allocator, parsed.config);
         systemUpgrade(allocator, parsed.config) catch |err| {
             g_run_summary.failures += 1;
             printFailureReport(err);
@@ -196,8 +239,10 @@ pub fn main() !void {
         return;
     }
 
+    // -Sua: AUR-only upgrade
     if (eql(cmd, "-Sua")) {
-        g_run_summary.begin();
+        beginRun();
+        startSudoLoop(allocator, parsed.config);
         aurUpgrade(allocator, parsed.config) catch |err| {
             g_run_summary.failures += 1;
             printFailureReport(err);
@@ -208,6 +253,25 @@ pub fn main() !void {
         return;
     }
 
+    // -Qu: check for updates (repo + AUR)
+    if (eql(cmd, "-Qu")) {
+        checkUpdates(allocator, parsed.config, false) catch |err| {
+            printFailureReport(err);
+            return err;
+        };
+        return;
+    }
+
+    // -Qua: check for AUR updates only
+    if (eql(cmd, "-Qua")) {
+        checkUpdates(allocator, parsed.config, true) catch |err| {
+            printFailureReport(err);
+            return err;
+        };
+        return;
+    }
+
+    // -Qm: list foreign packages
     if (eql(cmd, "-Qm")) {
         foreignPackages(allocator) catch |err| {
             printFailureReport(err);
@@ -216,6 +280,7 @@ pub fn main() !void {
         return;
     }
 
+    // Passthrough anything else that starts with -
     if (parsed.args[0].len > 0 and parsed.args[0][0] == '-') {
         try pacmanPassthrough(allocator, parsed.config, parsed.args);
         return;
@@ -224,28 +289,92 @@ pub fn main() !void {
     return usageErr("unknown command (tip: pacman-like flags are passed through)");
 }
 
+fn initColorMode(allocator: Allocator, config: RunConfig) void {
+    const should_disable = blk: {
+        // Explicit --color=never
+        if (config.color_mode == .never) break :blk true;
+        // Explicit --color=always means force color
+        if (config.color_mode == .always) break :blk false;
+        // NO_COLOR env
+        const no_color = std.process.getEnvVarOwned(allocator, "NO_COLOR") catch null;
+        if (no_color) |v| {
+            allocator.free(v);
+            break :blk true;
+        }
+        // Auto: disable if stderr is not a TTY
+        if (!stderrIsTty()) break :blk true;
+        break :blk false;
+    };
+    if (should_disable) {
+        color_reset = "";
+        color_title = "";
+        color_ok = "";
+        color_warn = "";
+        color_err = "";
+        color_dim = "";
+    }
+}
+
+fn stderrIsTty() bool {
+    if (@hasDecl(std.fs.File, "stderr")) return std.fs.File.stderr().isTty();
+    if (@hasDecl(std, "io")) {
+        if (@hasDecl(std.io, "getStdErr")) return std.io.getStdErr().isTty();
+    }
+    if (@hasDecl(std, "Io")) {
+        if (@hasDecl(std.Io, "getStdErr")) return std.Io.getStdErr().isTty();
+    }
+    return true;
+}
+
+fn startSudoLoop(allocator: Allocator, config: RunConfig) void {
+    if (!config.sudoloop or g_sudoloop_running) return;
+    g_sudoloop_running = true;
+    // Initial sudo auth
+    _ = runStreaming(allocator, &.{ "sudo", "-v" }) catch {};
+    // Spawn background thread to keep sudo alive
+    _ = std.Thread.spawn(.{}, sudoLoopThread, .{allocator}) catch {};
+}
+
+fn sudoLoopThread(allocator: Allocator) void {
+    while (g_sudoloop_running) {
+        sleepNs(sudoloop_interval_ns);
+        _ = runStatus(allocator, null, &.{ "sudo", "-vn" }) catch {};
+    }
+}
+
 fn printUsage() void {
     title("melon");
+    std.debug.print("  v{s}\n", .{melon_version});
     std.debug.print(
         \\  AUR helper in Zig
         \\
         \\  Commands
-        \\    melon -Ss <query>        Search repos + AUR
+        \\    melon -Ss <query>        Search repos + AUR (interactive selection)
+        \\    melon -Qs <query>        Search locally installed packages
         \\    melon -Si <package>      Show package info
         \\    melon -S <pkg...>        Install packages (repo first, AUR fallback)
         \\    melon -Syu               Full upgrade: pacman sync + AUR updates
         \\    melon -Sua               Upgrade only installed AUR packages
+        \\    melon -Qu                Check for updates (repo + AUR)
+        \\    melon -Qua               Check for AUR updates only
         \\    melon -Qm                List foreign (AUR/manual) packages
+        \\    melon -G <pkg...>        Clone AUR package repo(s) to current dir
+        \\    melon -Sc                Clean pacman cache + melon info cache
+        \\    melon -Scc               Deep clean all caches
         \\    melon <pacman flags...>  Passthrough to pacman for other operations
         \\
         \\  Melon Options
+        \\    --version                Show version
         \\    --dry-run                Print mutating actions without executing them
         \\    --json                   Output machine-readable summaries where available
+        \\    --color=auto|always|never
+        \\                             Control color output (default: auto)
         \\    --assume-reviewed        Skip AUR review prompts for this run
         \\    --i-know-what-im-doing   Required with --assume-reviewed in non-interactive runs
         \\    --cache-info             Show melon cache size/details
         \\    --cache-clean            Remove melon cache data
         \\    --resume-failed          Retry last failed package set
+        \\    --bottomup / --topdown   Sort AUR search results (default: topdown)
         \\    --[no]pgpfetch           Prompt to import PGP keys from PKGBUILDs
         \\    --[no]useask             Automatically resolve conflicts using pacman's ask flag
         \\    --[no]savechanges        Commit changes to PKGBUILDs made during review
@@ -262,6 +391,7 @@ fn printUsage() void {
         \\    --[no]sign               Sign packages with gpg
         \\    --[no]signdb             Sign databases with gpg
         \\    --[no]localrepo          Build packages into a local repo
+        \\    --rebuild                Force matching targets to be rebuilt
         \\    melon -h | --help        Show help
         \\
     , .{});
@@ -341,7 +471,7 @@ fn installWithCompatibility(allocator: Allocator, config: RunConfig, raw_args: [
     for (aur_targets, 0..) |pkg, idx| {
         progressLine("aur target", pkg, idx + 1, aur_targets.len);
         warnLineFmt("using AUR for: {s}", .{pkg});
-        installAurPackageRecursive(allocator, &ctx, pkg, true, false) catch |err| {
+        installAurPackageRecursive(allocator, &ctx, pkg, !config.rebuild, false) catch |err| {
             recordFailedPackage(allocator, pkg) catch {};
             if (config.failfast) return err;
             g_run_summary.failures += 1;
@@ -355,7 +485,7 @@ fn installWithCompatibility(allocator: Allocator, config: RunConfig, raw_args: [
         for (official_targets, 0..) |pkg, idx| {
             progressLine("aur fallback", pkg, idx + 1, official_targets.len);
             warnLineFmt("repo unavailable, trying AUR for: {s}", .{pkg});
-            installAurPackageRecursive(allocator, &ctx, pkg, true, false) catch |err| {
+            installAurPackageRecursive(allocator, &ctx, pkg, !config.rebuild, false) catch |err| {
                 recordFailedPackage(allocator, pkg) catch {};
                 if (config.failfast) return err;
                 g_run_summary.failures += 1;
@@ -432,22 +562,69 @@ fn searchPackages(allocator: Allocator, config: RunConfig, query: []const u8) !v
         return;
     }
 
-    var shown: usize = 0;
-    if (g_json_output) std.debug.print("{{\"command\":\"-Ss\",\"query\":\"{s}\",\"aur\":[", .{query});
+    // Collect results so we can optionally reverse (bottomup) and show names for selection
+    const SearchResult = struct {
+        name: []const u8,
+        version: []const u8,
+        desc: []const u8,
+        votes: i64,
+        popularity: f64,
+        out_of_date: bool,
+    };
+
+    var result_list: std.ArrayListUnmanaged(SearchResult) = .{};
+    defer result_list.deinit(allocator);
+
     for (results.items) |entry| {
         if (entry != .object) continue;
         const name = getString(entry, "Name") orelse "<unknown>";
         const version = getString(entry, "Version") orelse "<unknown>";
         const desc = getString(entry, "Description") orelse "";
+        const votes: i64 = if (getInt(entry, "NumVotes")) |v| v else 0;
+        const popularity: f64 = if (getFloat(entry, "Popularity")) |v| v else 0.0;
+        const out_of_date = (getInt(entry, "OutOfDate") orelse 0) != 0;
+
+        try result_list.append(allocator, .{
+            .name = name,
+            .version = version,
+            .desc = desc,
+            .votes = votes,
+            .popularity = popularity,
+            .out_of_date = out_of_date,
+        });
+    }
+
+    if (result_list.items.len == 0) return;
+
+    // Bottomup: reverse the display order so highest-numbered result is at top
+    const items = result_list.items;
+    const bottomup = config.bottomup;
+
+    var shown: usize = 0;
+    if (g_json_output) std.debug.print("{{\"command\":\"-Ss\",\"query\":\"{s}\",\"aur\":[", .{query});
+
+    var display_idx: usize = 0;
+    while (display_idx < items.len) : (display_idx += 1) {
+        const idx = if (bottomup) items.len - 1 - display_idx else display_idx;
+        const r = items[idx];
         shown += 1;
+        const display_num = idx + 1;
         if (g_json_output) {
             if (shown > 1) std.debug.print(",", .{});
-            std.debug.print("{{\"name\":\"{s}\",\"version\":\"{s}\"}}", .{ name, version });
+            std.debug.print("{{\"name\":\"{s}\",\"version\":\"{s}\",\"votes\":{d},\"popularity\":{d:.2},\"out_of_date\":{}}}", .{ r.name, r.version, r.votes, r.popularity, r.out_of_date });
         } else {
-            std.debug.print("{s}[{d: >2}]{s} aur/{s} {s}\n", .{ color_title, shown, color_reset, name, version });
-            if (desc.len > 0) std.debug.print("     {s}{s}{s}\n", .{ color_dim, desc, color_reset });
+            const ood = if (r.out_of_date) " [OutOfDate]" else "";
+            std.debug.print("{s}[{d: >2}]{s} aur/{s} {s}", .{
+                color_title, display_num, color_reset, r.name, r.version,
+            });
+            std.debug.print("{s}{s}{s} {s}(+{d} {d:.2}){s}\n", .{
+                color_err, ood, color_reset,
+                color_dim, r.votes, r.popularity, color_reset,
+            });
+            if (r.desc.len > 0) std.debug.print("     {s}{s}{s}\n", .{ color_dim, r.desc, color_reset });
         }
     }
+
     if (g_json_output) {
         std.debug.print("],\"aur_results\":{d}}}\n", .{shown});
     } else {
@@ -476,6 +653,48 @@ fn searchPackages(allocator: Allocator, config: RunConfig, query: []const u8) !v
         std.debug.print("{s}provider{s} aur/{s} {s}\n", .{ color_title, color_reset, name, version });
         if (desc.len > 0) std.debug.print("  {s}{s}{s}\n", .{ color_dim, desc, color_reset });
     }
+
+    // Interactive selection: prompt to install packages by number
+    if (g_json_output or !stdinIsTty()) return;
+    rule();
+    std.debug.print("\n{s}Enter package numbers to install (e.g. 1 3 5), or press Enter to skip:{s}\n", .{ color_title, color_reset });
+    const selection_raw = promptLine(allocator, ">> ") catch return;
+    defer allocator.free(selection_raw);
+    const trimmed_sel = std.mem.trim(u8, selection_raw, " \t\r\n");
+    if (trimmed_sel.len == 0) return;
+
+    // Parse space/comma separated numbers
+    var to_install: std.ArrayListUnmanaged([]const u8) = .{};
+    defer to_install.deinit(allocator);
+    var tok = std.mem.tokenizeAny(u8, trimmed_sel, " ,\t");
+    while (tok.next()) |num_str| {
+        const num = std.fmt.parseInt(usize, num_str, 10) catch {
+            warnLineFmt("ignoring invalid number: {s}", .{num_str});
+            continue;
+        };
+        if (num < 1 or num > items.len) {
+            warnLineFmt("ignoring out-of-range number: {d}", .{num});
+            continue;
+        }
+        try to_install.append(allocator, items[num - 1].name);
+    }
+    if (to_install.items.len == 0) return;
+
+    // Install selected packages
+    section("installing selected packages");
+    for (to_install.items) |pkg| {
+        okLineFmt("queuing: {s}", .{pkg});
+    }
+    var ctx = InstallContext.init(allocator, config);
+    defer ctx.deinit();
+    for (to_install.items) |pkg| {
+        installAurPackageRecursive(allocator, &ctx, pkg, true, false) catch |err| {
+            warnLineFmt("failed to install {s}: {s}", .{ pkg, @errorName(err) });
+            continue;
+        };
+        okLineFmt("installed: {s}", .{pkg});
+    }
+    try flushPendingBatchInstalls(allocator, &ctx);
 }
 
 fn infoPackage(allocator: Allocator, pkg: []const u8) !void {
@@ -640,6 +859,152 @@ fn foreignPackages(allocator: Allocator) !void {
     std.debug.print("]}}\n", .{});
 }
 
+fn checkUpdates(allocator: Allocator, config: RunConfig, aur_only: bool) !void {
+    title(if (aur_only) "AUR update check (-Qua)" else "Update check (-Qu)");
+
+    if (!aur_only) {
+        section("official repositories");
+        _ = runStreaming(allocator, &.{ "pacman", "-Qu" }) catch {};
+    }
+
+    section("AUR packages");
+    const aur_list = try listForeignPackageNames(allocator);
+    defer freeNameList(allocator, aur_list);
+
+    if (aur_list.len == 0) {
+        warnLine("no foreign packages found");
+        return;
+    }
+
+    try prefetchAurInfoInParallel(allocator, aur_list);
+    var ctx = InstallContext.init(allocator, config);
+    defer ctx.deinit();
+
+    var updates_available: usize = 0;
+    if (g_json_output) std.debug.print("{{\"command\":\"{s}\",\"updates\":[", .{if (aur_only) "-Qua" else "-Qu"});
+
+    for (aur_list, 0..) |pkg, idx| {
+        progressLine("check", pkg, idx + 1, aur_list.len);
+        const info = try fetchAurInfoCached(allocator, &ctx, pkg);
+        defer info.parsed.deinit();
+        if (info.entry == null) continue;
+        const entry = info.entry.?;
+
+        const latest = getString(entry, "Version") orelse continue;
+        const installed = try installedVersion(allocator, pkg);
+        defer allocator.free(installed);
+
+        const cmp = try vercmp(allocator, installed, latest);
+        if (cmp < 0 or (config.devel and isDevelPackageName(pkg))) {
+            updates_available += 1;
+            if (g_json_output) {
+                if (updates_available > 1) std.debug.print(",", .{});
+                std.debug.print("{{\"name\":\"{s}\",\"current\":\"{s}\",\"latest\":\"{s}\"}}", .{ pkg, installed, latest });
+            } else {
+                std.debug.print("{s}{s}{s} {s} -> {s}{s}{s}\n", .{
+                    color_warn, pkg, color_reset,
+                    installed,
+                    color_ok,   latest, color_reset,
+                });
+            }
+        }
+    }
+
+    if (g_json_output) {
+        std.debug.print("],\"count\":{d}}}\n", .{updates_available});
+    } else {
+        rule();
+        kvInt("updates available", updates_available);
+    }
+}
+
+fn cloneAurRepo(allocator: Allocator, pkg: []const u8) !void {
+    const repo_url = try std.fmt.allocPrint(allocator, "https://aur.archlinux.org/{s}.git", .{pkg});
+    defer allocator.free(repo_url);
+    sectionFmt("cloning aur/{s}", .{pkg});
+    const rc = try runStreamingRetry(allocator, &.{ "git", "clone", repo_url }, network_retry_max_attempts, network_retry_initial_delay_ms);
+    if (rc != 0) {
+        setFailureContext("clone", pkg, "git clone", "Check package name and network");
+        return error.AurCloneFailed;
+    }
+    okLineFmt("cloned {s}", .{pkg});
+}
+
+fn cleanCacheLight(allocator: Allocator, config: RunConfig) !void {
+    title("Clean cache (-Sc)");
+
+    section("pacman cache");
+    if (config.dry_run) {
+        printDryRunCommand("sudo pacman", &.{"-Sc"});
+    } else {
+        _ = try runPacmanSudoMaybe(allocator, config, &.{"-Sc"});
+    }
+
+    section("melon info cache");
+    const cache_root = try melonCacheRoot(allocator);
+    defer allocator.free(cache_root);
+    const info_dir = try std.fmt.allocPrint(allocator, "{s}/aur-info", .{cache_root});
+    defer allocator.free(info_dir);
+
+    if (config.dry_run) {
+        std.debug.print("{s}[dry-run]{s} rm -rf {s}\n", .{ color_warn, color_reset, info_dir });
+    } else {
+        std.fs.deleteTreeAbsolute(info_dir) catch |err| switch (err) {
+            error.FileNotFound => {},
+            else => return err,
+        };
+    }
+    okLine("info cache cleaned");
+}
+
+fn cleanCacheDeep(allocator: Allocator, config: RunConfig) !void {
+    title("Deep clean cache (-Scc)");
+
+    section("pacman cache");
+    if (config.dry_run) {
+        printDryRunCommand("sudo pacman", &.{"-Scc"});
+    } else {
+        _ = try runPacmanSudoMaybe(allocator, config, &.{"-Scc"});
+    }
+
+    section("melon cache");
+    const cache_root = try melonCacheRoot(allocator);
+    defer allocator.free(cache_root);
+
+    if (config.dry_run) {
+        std.debug.print("{s}[dry-run]{s} rm -rf {s}\n", .{ color_warn, color_reset, cache_root });
+    } else {
+        std.fs.deleteTreeAbsolute(cache_root) catch |err| switch (err) {
+            error.FileNotFound => {},
+            else => return err,
+        };
+    }
+    okLine("all caches deep cleaned");
+}
+
+fn showOptionalDeps(allocator: Allocator, srcinfo: []const u8, pkg: []const u8) void {
+    var has_optdeps = false;
+    var it = std.mem.splitScalar(u8, srcinfo, '\n');
+    while (it.next()) |line| {
+        const trimmed = std.mem.trim(u8, line, " \t\r");
+        if (!std.mem.startsWith(u8, trimmed, "optdepends = ")) continue;
+        if (!has_optdeps) {
+            has_optdeps = true;
+            sectionFmt("optional dependencies for {s}", .{pkg});
+        }
+        const eq = std.mem.indexOfScalar(u8, trimmed, '=') orelse continue;
+        const dep = std.mem.trim(u8, trimmed[eq + 1 ..], " \t");
+        if (dep.len == 0) continue;
+        const base_dep = dependencyBaseName(dep);
+        const installed = isDependencySatisfied(allocator, base_dep) catch false;
+        if (installed) {
+            std.debug.print("  {s}[installed]{s} {s}\n", .{ color_ok, color_reset, dep });
+        } else {
+            std.debug.print("  {s}[optional]{s}  {s}\n", .{ color_dim, color_reset, dep });
+        }
+    }
+}
+
 fn installAurPackageRecursive(allocator: Allocator, ctx: *InstallContext, pkg: []const u8, skip_if_installed: bool, is_dependency: bool) anyerror!void {
     if (skip_if_installed and (try isInstalledPackage(allocator, pkg))) return;
 
@@ -653,6 +1018,7 @@ fn installAurPackageRecursive(allocator: Allocator, ctx: *InstallContext, pkg: [
     if (ctx.visiting_aur.contains(repo_base)) {
         errLineFmt("dependency cycle detected at aur/{s}", .{repo_base});
         return error.DependencyCycle;
+
     }
     try ctx.visiting_aur.put(try ctx.allocator.dupe(u8, repo_base), {});
     errdefer removeStringSetEntryAndFreeKey(ctx.allocator, &ctx.visiting_aur, repo_base);
@@ -695,6 +1061,7 @@ fn installAurPackageRecursive(allocator: Allocator, ctx: *InstallContext, pkg: [
     defer allocator.free(srcinfo);
 
     try resolveAurDependencies(allocator, ctx, srcinfo);
+    if (!g_json_output) showOptionalDeps(allocator, srcinfo, pkg);
     try reviewAurPackage(allocator, ctx, build_dir, pkg, repo_base, srcinfo, repo_sync.reviewed_from);
     if (ctx.config.savechanges) try savePkgbuildReviewChanges(allocator, build_dir, repo_base);
 
@@ -753,17 +1120,21 @@ fn ensureDependencyInstalled(allocator: Allocator, ctx: *InstallContext, dep: []
     if (try isOfficialPackage(allocator, dep)) {
         sectionFmt("install dependency from repos: {s}", .{dep});
         const rc = try runPacmanSudoMaybe(allocator, ctx.config, &.{ "-S", "--needed", dep });
-        if (rc != 0) {
-            warnLineFmt("repo dependency install failed for {s}; trying AUR fallback", .{dep});
-            try installAurPackageRecursive(allocator, ctx, dep, true, true);
+        if (rc == 0) {
+            if (ctx.config.installdebug) try installDebugCompanions(allocator, ctx.config, &.{dep});
             return;
         }
-        if (ctx.config.installdebug) try installDebugCompanions(allocator, ctx.config, &.{dep});
-        return;
+        warnLineFmt("repo dependency install failed for {s}; trying AUR fallback", .{dep});
     }
 
-    sectionFmt("install dependency from AUR: {s}", .{dep});
-    try installAurPackageRecursive(allocator, ctx, dep, true, true);
+    const selected = (try selectAurProvider(allocator, dep)) orelse {
+        errLineFmt("no provider found for dependency '{s}'", .{dep});
+        return error.NotFound;
+    };
+    defer allocator.free(selected);
+
+    sectionFmt("install dependency from AUR: {s} (providing {s})", .{ selected, dep });
+    try installAurPackageRecursive(allocator, ctx, selected, true, true);
 }
 
 fn reviewAurPackage(allocator: Allocator, ctx: *InstallContext, build_dir: []const u8, pkg: []const u8, repo_base: []const u8, srcinfo: []const u8, reviewed_from: ?[]const u8) !void {
@@ -1057,6 +1428,122 @@ fn installedVersion(allocator: Allocator, pkg: []const u8) ![]u8 {
     _ = tok.next() orelse return error.InvalidPacmanOutput;
     const version = tok.next() orelse return error.InvalidPacmanOutput;
     return try allocator.dupe(u8, version);
+}
+
+const AurCandidate = struct {
+    name: []const u8,
+    version: []const u8,
+    description: []const u8,
+};
+
+fn fetchAurCandidates(allocator: Allocator, dep: []const u8) ![]AurCandidate {
+    var candidates: std.ArrayListUnmanaged(AurCandidate) = .{};
+    errdefer {
+        for (candidates.items) |c| {
+            allocator.free(c.name);
+            allocator.free(c.version);
+            allocator.free(c.description);
+        }
+        candidates.deinit(allocator);
+    }
+
+    // 1. Try exact match info
+    const info_body = fetchAurInfoBody(allocator, dep) catch null;
+    if (info_body) |body| {
+        defer allocator.free(body);
+        const parsed = try std.json.parseFromSlice(std.json.Value, allocator, body, .{});
+        defer parsed.deinit();
+        if (getArray(parsed.value, "results")) |results| {
+            for (results.items) |item| {
+                const name = getString(item, "Name") orelse continue;
+                const version = getString(item, "Version") orelse "";
+                const desc = getString(item, "Description") orelse "";
+                try candidates.append(allocator, .{
+                    .name = try allocator.dupe(u8, name),
+                    .version = try allocator.dupe(u8, version),
+                    .description = try allocator.dupe(u8, desc),
+                });
+            }
+        }
+    }
+
+    // 2. Search by provides
+    const enc = try urlEncode(allocator, dep);
+    defer allocator.free(enc);
+    const prov_url = try std.fmt.allocPrint(allocator, "https://aur.archlinux.org/rpc/v5/search/{s}?by=provides", .{enc});
+    defer allocator.free(prov_url);
+    const prov_body = fetchUrl(allocator, prov_url) catch null;
+    if (prov_body) |body| {
+        defer allocator.free(body);
+        const parsed = try std.json.parseFromSlice(std.json.Value, allocator, body, .{});
+        defer parsed.deinit();
+        if (getArray(parsed.value, "results")) |results| {
+            for (results.items) |item| {
+                const name = getString(item, "Name") orelse continue;
+
+                var already_in = false;
+                for (candidates.items) |c| {
+                    if (std.mem.eql(u8, c.name, name)) {
+                        already_in = true;
+                        break;
+                    }
+                }
+                if (already_in) continue;
+
+                const version = getString(item, "Version") orelse "";
+                const desc = getString(item, "Description") orelse "";
+                try candidates.append(allocator, .{
+                    .name = try allocator.dupe(u8, name),
+                    .version = try allocator.dupe(u8, version),
+                    .description = try allocator.dupe(u8, desc),
+                });
+            }
+        }
+    }
+
+    return try candidates.toOwnedSlice(allocator);
+}
+
+fn selectAurProvider(allocator: Allocator, dep: []const u8) !?[]u8 {
+    const candidates = try fetchAurCandidates(allocator, dep);
+    defer {
+        for (candidates) |c| {
+            allocator.free(c.name);
+            allocator.free(c.version);
+            allocator.free(c.description);
+        }
+        allocator.free(candidates);
+    }
+
+    if (candidates.len == 0) return null;
+    if (candidates.len == 1) return try allocator.dupe(u8, candidates[0].name);
+
+    if (!stdinIsTty()) return try allocator.dupe(u8, candidates[0].name);
+
+    sectionFmt("There are {d} providers available for {s}:", .{ candidates.len, dep });
+    for (candidates, 0..) |c, i| {
+        std.debug.print("{s}{d: >2}){s} aur/{s} {s}\n", .{ color_title, i + 1, color_reset, c.name, c.version });
+        if (c.description.len > 0) {
+            std.debug.print("    {s}{s}{s}\n", .{ color_dim, c.description, color_reset });
+        }
+    }
+
+    while (true) {
+        const prompt = try std.fmt.allocPrint(allocator, "Enter a number [1-{d}]: ", .{candidates.len});
+        defer allocator.free(prompt);
+        const choice_raw = try promptLine(allocator, prompt);
+        defer allocator.free(choice_raw);
+
+        const selection = std.fmt.parseInt(usize, choice_raw, 10) catch {
+            warnLine("Invalid selection");
+            continue;
+        };
+        if (selection < 1 or selection > candidates.len) {
+            warnLine("Selection out of range");
+            continue;
+        }
+        return try allocator.dupe(u8, candidates[selection - 1].name);
+    }
 }
 
 fn vercmp(allocator: Allocator, a: []const u8, b: []const u8) !i32 {
@@ -1634,8 +2121,10 @@ fn isInstalledPackage(allocator: Allocator, pkg: []const u8) !bool {
 }
 
 fn isOfficialPackage(allocator: Allocator, pkg: []const u8) !bool {
-    const rc = runStatus(allocator, null, &.{ "pacman", "-Si", pkg }) catch return false;
-    return rc == 0;
+    const rc = runStatus(allocator, null, &.{ "pacman", "-Si", pkg }) catch 1;
+    if (rc == 0) return true;
+    const rc_prov = runStatus(allocator, null, &.{ "pacman", "-Sp", "--noconfirm", pkg }) catch 1;
+    return rc_prov == 0;
 }
 
 fn pacmanPassthrough(allocator: Allocator, config: RunConfig, pacman_args: []const []const u8) !void {
@@ -1695,7 +2184,7 @@ fn runPacmanSudoMaybe(allocator: Allocator, config: RunConfig, pacman_args: []co
         printDryRunCommand("sudo pacman", effective);
         return 0;
     }
-    if (config.sudoloop) _ = runStreaming(allocator, &.{ "sudo", "-v" }) catch 1;
+    // sudoloop is now handled by the background thread (startSudoLoop)
     return runPacmanSudo(allocator, effective);
 }
 
@@ -1779,6 +2268,21 @@ fn getArray(v: std.json.Value, key: []const u8) ?std.json.Array {
     const candidate = getValue(v, key) orelse return null;
     if (candidate != .array) return null;
     return candidate.array;
+}
+
+fn getInt(v: std.json.Value, key: []const u8) ?i64 {
+    const candidate = getValue(v, key) orelse return null;
+    if (candidate != .integer) return null;
+    return candidate.integer;
+}
+
+fn getFloat(v: std.json.Value, key: []const u8) ?f64 {
+    const candidate = getValue(v, key) orelse return null;
+    return switch (candidate) {
+        .float => candidate.float,
+        .integer => @as(f64, @floatFromInt(candidate.integer)),
+        else => null,
+    };
 }
 
 fn freeStringSetKeys(allocator: Allocator, set: *std.StringHashMap(void)) void {

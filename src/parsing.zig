@@ -2,6 +2,12 @@ const std = @import("std");
 
 const Allocator = std.mem.Allocator;
 
+pub const ColorMode = enum {
+    auto,
+    always,
+    never,
+};
+
 pub const RunConfig = struct {
     dry_run: bool = false,
     assume_reviewed: bool = false,
@@ -10,6 +16,9 @@ pub const RunConfig = struct {
     cache_clean: bool = false,
     cache_info: bool = false,
     resume_failed: bool = false,
+    version: bool = false,
+    bottomup: bool = false,
+    color_mode: ColorMode = .auto,
     pgpfetch: bool = false,
     useask: bool = false,
     savechanges: bool = false,
@@ -26,6 +35,7 @@ pub const RunConfig = struct {
     sign: bool = false,
     signdb: bool = false,
     localrepo: bool = false,
+    rebuild: bool = false,
 };
 
 pub const ParsedCli = struct {
@@ -72,6 +82,23 @@ fn matchGlobalOption(arg: []const u8, config: ?*RunConfig) bool {
     if (eql(arg, "--cache-clean")) return setConfigBool(config, "cache_clean", true);
     if (eql(arg, "--cache-info")) return setConfigBool(config, "cache_info", true);
     if (eql(arg, "--resume-failed")) return setConfigBool(config, "resume_failed", true);
+    if (eql(arg, "--version")) return setConfigBool(config, "version", true);
+    if (eql(arg, "--bottomup")) return setConfigBool(config, "bottomup", true);
+    if (eql(arg, "--topdown")) return setConfigBool(config, "bottomup", false);
+
+    // --color=auto|always|never
+    if (eql(arg, "--color=always")) {
+        if (config) |cfg| cfg.color_mode = .always;
+        return true;
+    }
+    if (eql(arg, "--color=never")) {
+        if (config) |cfg| cfg.color_mode = .never;
+        return true;
+    }
+    if (eql(arg, "--color=auto") or eql(arg, "--color")) {
+        if (config) |cfg| cfg.color_mode = .auto;
+        return true;
+    }
 
     if (eql(arg, "--pgpfetch")) return setConfigBool(config, "pgpfetch", true);
     if (eql(arg, "--nopgpfetch")) return setConfigBool(config, "pgpfetch", false);
@@ -105,6 +132,7 @@ fn matchGlobalOption(arg: []const u8, config: ?*RunConfig) bool {
     if (eql(arg, "--nosigndb")) return setConfigBool(config, "signdb", false);
     if (eql(arg, "--localrepo")) return setConfigBool(config, "localrepo", true);
     if (eql(arg, "--nolocalrepo")) return setConfigBool(config, "localrepo", false);
+    if (eql(arg, "--rebuild")) return setConfigBool(config, "rebuild", true);
 
     return false;
 }

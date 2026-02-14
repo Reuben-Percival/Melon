@@ -4,6 +4,12 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
+    // Determine version string at build-time
+    const version = b.option([]const u8, "version", "Override version string") orelse "dev";
+
+    const options = b.addOptions();
+    options.addOption([]const u8, "version", version);
+
     const exe = if (@hasField(std.Build.ExecutableOptions, "root_module"))
         b.addExecutable(.{
             .name = "melon",
@@ -20,6 +26,10 @@ pub fn build(b: *std.Build) void {
             .target = target,
             .optimize = optimize,
         });
+
+    if (@hasDecl(@TypeOf(exe.*), "root_module")) {
+        exe.root_module.addOptions("build_options", options);
+    }
 
     b.installArtifact(exe);
 
@@ -44,6 +54,11 @@ pub fn build(b: *std.Build) void {
             .target = target,
             .optimize = optimize,
         });
+
+    if (@hasDecl(@TypeOf(unit_tests.*), "root_module")) {
+        unit_tests.root_module.addOptions("build_options", options);
+    }
+
     const run_unit_tests = b.addRunArtifact(unit_tests);
 
     const test_step = b.step("test", "Run unit tests");
