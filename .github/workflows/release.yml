@@ -4,16 +4,23 @@ on:
   push:
     tags:
       - "v*"
+  workflow_dispatch:
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
 
 permissions:
   contents: write
 
 jobs:
-  build:
+  release:
+    name: Build and publish release
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     env:
       ZIG_GLOBAL_CACHE_DIR: ${{ github.workspace }}/.zig-global-cache
-      ZIG_LOCAL_CACHE_DIR: ${{ github.workspace }}/.zig-cache
+      ZIG_LOCAL_CACHE_DIR: ${{ github.workspace }}/.zig-local-cache
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -21,20 +28,43 @@ jobs:
       - name: Setup Zig
         uses: mlugg/setup-zig@v2
         with:
-          version: 0.13.0
+          version: 0.15.2
 
-      - name: Zig version
-        run: zig version
-
-      - name: Build release binary
-        run: zig build -Doptimize=ReleaseSafe
-
-      - name: Prepare artifact
+      - name: Resolve release version
+        id: version
+        shell: bash
         run: |
+          set -euo pipefail
+          if [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
+            VERSION="${GITHUB_REF_NAME#v}"
+          else
+            VERSION="dev"
+          fi
+          echo "value=${VERSION}" >> "${GITHUB_OUTPUT}"
+
+      - name: Build artifact
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "::group::Environment"
+          zig version
+          echo "::endgroup::"
+          echo "::group::Build"
+          zig build -Doptimize=ReleaseSafe -Dversion="${{ steps.version.outputs.value }}"
+          echo "::endgroup::"
+
+      - name: Package artifact
+        shell: bash
+        run: |
+          set -euo pipefail
           mkdir -p dist
-          cp zig-out/bin/melon dist/melon-linux-x86_64
+          cp zig-out/bin/melon "dist/melon-linux-x86_64"
+          sha256sum "dist/melon-linux-x86_64" > "dist/melon-linux-x86_64.sha256"
 
       - name: Publish GitHub release assets
         uses: softprops/action-gh-release@v2
         with:
-          files: dist/melon-linux-x86_64
+          generate_release_notes: true
+          files: |
+            dist/melon-linux-x86_64
+            dist/melon-linux-x86_64.sha256

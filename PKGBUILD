@@ -19,12 +19,12 @@ pkgver() {
 
 build() {
   cd "$srcdir/Melon"
-  zig build -Doptimize=ReleaseSafe
+  zig build -Doptimize=ReleaseSafe -Dversion="$pkgver"
 }
 
 check() {
   cd "$srcdir/Melon"
-  zig build test
+  zig build test -Dversion="$pkgver"
 }
 
 package() {

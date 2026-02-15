@@ -27,7 +27,7 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
         });
 
-    if (@hasDecl(@TypeOf(exe.*), "root_module")) {
+    if (@hasField(@TypeOf(exe.*), "root_module")) {
         exe.root_module.addOptions("build_options", options);
     }
 
@@ -55,7 +55,7 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
         });
 
-    if (@hasDecl(@TypeOf(unit_tests.*), "root_module")) {
+    if (@hasField(@TypeOf(unit_tests.*), "root_module")) {
         unit_tests.root_module.addOptions("build_options", options);
     }
 

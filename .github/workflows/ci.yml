@@ -5,19 +5,65 @@ on:
     branches:
       - main
   pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
-  build-and-test:
+  checks:
+    name: Checks (Zig 0.15.2)
     runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      ZIG_GLOBAL_CACHE_DIR: ${{ github.workspace }}/.zig-global-cache
+      ZIG_LOCAL_CACHE_DIR: ${{ github.workspace }}/.zig-local-cache
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.15.2
+
+      - name: Cache Zig directories
+        uses: actions/cache@v4
+        with:
+          path: |
+            .zig-global-cache
+            .zig-local-cache
+          key: ${{ runner.os }}-zig-0.15.2-${{ hashFiles('build.zig', 'build.zig.zon', 'src/**', 'README.md') }}
+          restore-keys: |
+            ${{ runner.os }}-zig-0.15.2-
+
+      - name: Build and test
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "::group::Environment"
+          zig version
+          echo "::endgroup::"
+          echo "::group::Build"
+          zig build
+          echo "::endgroup::"
+          echo "::group::Unit tests"
+          zig build test
+          echo "::endgroup::"
+
+  compatibility:
+    name: Compatibility (Zig ${{ matrix.zig-version }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
     strategy:
       fail-fast: false
       matrix:
         zig-version:
           - 0.13.0
-          - 0.15.2
     env:
       ZIG_GLOBAL_CACHE_DIR: ${{ github.workspace }}/.zig-global-cache
-      ZIG_LOCAL_CACHE_DIR: ${{ github.workspace }}/.zig-cache
+      ZIG_LOCAL_CACHE_DIR: ${{ github.workspace }}/.zig-local-cache
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -27,11 +73,55 @@ jobs:
         with:
           version: ${{ matrix.zig-version }}
 
-      - name: Zig version
-        run: zig version
+      - name: Build and test
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "::group::Environment"
+          zig version
+          echo "::endgroup::"
+          echo "::group::Build"
+          zig build
+          echo "::endgroup::"
+          echo "::group::Unit tests"
+          zig build test
+          echo "::endgroup::"
 
-      - name: Build
-        run: zig build
+  arch-linux:
+    name: Arch Linux build (pacman)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    container:
+      image: archlinux:latest
+    env:
+      ZIG_GLOBAL_CACHE_DIR: ${{ github.workspace }}/.zig-global-cache
+      ZIG_LOCAL_CACHE_DIR: ${{ github.workspace }}/.zig-local-cache
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
 
-      - name: Unit tests
-        run: zig build test
+      - name: Install toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "::group::Pacman update"
+          pacman -Syu --noconfirm --needed archlinux-keyring
+          echo "::endgroup::"
+          echo "::group::Install dependencies"
+          pacman -S --noconfirm --needed zig git base-devel
+          echo "::endgroup::"
+
+      - name: Build and test
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "::group::Environment"
+          zig version
+          uname -a
+          echo "::endgroup::"
+          echo "::group::Build"
+          zig build
+          echo "::endgroup::"
+          echo "::group::Unit tests"
+          zig build test
+          echo "::endgroup::"

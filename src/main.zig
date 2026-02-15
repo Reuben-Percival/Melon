@@ -24,7 +24,8 @@ const runStatus = process.runStatus;
 const runCapture = process.runCapture;
 const runCaptureCwd = process.runCaptureCwd;
 
-const melon_version = "0.3.0";
+const build_options = @import("build_options");
+const melon_version = build_options.version;
 
 var color_reset: []const u8 = "\x1b[0m";
 var color_title: []const u8 = "\x1b[1;36m";
@@ -210,6 +211,16 @@ pub fn main() !void {
         return;
     }
 
+    // -Cbd: prune all orphaned dependency packages
+    if (eql(cmd, "-Cbd")) {
+        startSudoLoop(allocator, parsed.config);
+        cleanBuildDependencies(allocator, parsed.config) catch |err| {
+            printFailureReport(err);
+            return err;
+        };
+        return;
+    }
+
     // -S: install
     if (eql(cmd, "-S")) {
         if (parsed.args.len < 2) return usageErr("missing package name(s)");
@@ -361,6 +372,7 @@ fn printUsage() void {
         \\    melon -G <pkg...>        Clone AUR package repo(s) to current dir
         \\    melon -Sc                Clean pacman cache + melon info cache
         \\    melon -Scc               Deep clean all caches
+        \\    melon -Cbd               Prune all unused dependency packages
         \\    melon <pacman flags...>  Passthrough to pacman for other operations
         \\
         \\  Melon Options
@@ -470,7 +482,6 @@ fn installWithCompatibility(allocator: Allocator, config: RunConfig, raw_args: [
     defer ctx.deinit();
     for (aur_targets, 0..) |pkg, idx| {
         progressLine("aur target", pkg, idx + 1, aur_targets.len);
-        warnLineFmt("using AUR for: {s}", .{pkg});
         installAurPackageRecursive(allocator, &ctx, pkg, !config.rebuild, false) catch |err| {
             recordFailedPackage(allocator, pkg) catch {};
             if (config.failfast) return err;
@@ -478,7 +489,7 @@ fn installWithCompatibility(allocator: Allocator, config: RunConfig, raw_args: [
             printFailureReport(err);
             continue;
         };
-        okLineFmt("AUR install complete: {s}", .{pkg});
+        okLineFmt("installed aur/{s}", .{pkg});
     }
 
     if (fallback_official_to_aur) {
@@ -492,7 +503,7 @@ fn installWithCompatibility(allocator: Allocator, config: RunConfig, raw_args: [
                 printFailureReport(err);
                 continue;
             };
-            okLineFmt("AUR fallback install complete: {s}", .{pkg});
+            okLineFmt("installed aur/{s} (fallback)", .{pkg});
         }
     }
     try flushPendingBatchInstalls(allocator, &ctx);
@@ -603,12 +614,18 @@ fn searchPackages(allocator: Allocator, config: RunConfig, query: []const u8) !v
     var shown: usize = 0;
     if (g_json_output) std.debug.print("{{\"command\":\"-Ss\",\"query\":\"{s}\",\"aur\":[", .{query});
 
+    const display_order = try allocator.alloc(usize, items.len);
+    defer allocator.free(display_order);
+    for (display_order, 0..) |*slot, order_idx| {
+        slot.* = if (bottomup) items.len - 1 - order_idx else order_idx;
+    }
+
     var display_idx: usize = 0;
     while (display_idx < items.len) : (display_idx += 1) {
-        const idx = if (bottomup) items.len - 1 - display_idx else display_idx;
+        const idx = display_order[display_idx];
         const r = items[idx];
         shown += 1;
-        const display_num = idx + 1;
+        const display_num = display_idx + 1;
         if (g_json_output) {
             if (shown > 1) std.debug.print(",", .{});
             std.debug.print("{{\"name\":\"{s}\",\"version\":\"{s}\",\"votes\":{d},\"popularity\":{d:.2},\"out_of_date\":{}}}", .{ r.name, r.version, r.votes, r.popularity, r.out_of_date });
@@ -676,14 +693,14 @@ fn searchPackages(allocator: Allocator, config: RunConfig, query: []const u8) !v
             warnLineFmt("ignoring out-of-range number: {d}", .{num});
             continue;
         }
-        try to_install.append(allocator, items[num - 1].name);
+        try to_install.append(allocator, items[display_order[num - 1]].name);
     }
     if (to_install.items.len == 0) return;
 
     // Install selected packages
-    section("installing selected packages");
+    sectionFmt("installing {d} selected AUR package(s)", .{to_install.items.len});
     for (to_install.items) |pkg| {
-        okLineFmt("queuing: {s}", .{pkg});
+        progressLine("selected", pkg, 0, 0);
     }
     var ctx = InstallContext.init(allocator, config);
     defer ctx.deinit();
@@ -982,6 +999,64 @@ fn cleanCacheDeep(allocator: Allocator, config: RunConfig) !void {
     okLine("all caches deep cleaned");
 }
 
+fn cleanBuildDependencies(allocator: Allocator, config: RunConfig) !void {
+    title("Prune unused dependencies (-Cbd)");
+
+    var pass: usize = 0;
+    var total_removed: usize = 0;
+
+    while (true) {
+        const status_rc = try runStatus(allocator, null, &.{ "pacman", "-Qtdq" });
+        if (status_rc == 1) break;
+        if (status_rc != 0) {
+            setFailureContext("query orphaned dependencies", "pacman", "pacman -Qtdq", "Check pacman database health and rerun");
+            return error.CommandFailed;
+        }
+
+        const orphaned = try runCapture(allocator, &.{ "pacman", "-Qtdq" });
+        defer allocator.free(orphaned);
+
+        var packages = std.ArrayListUnmanaged([]const u8){};
+        defer packages.deinit(allocator);
+
+        var tok = std.mem.tokenizeAny(u8, orphaned, " \t\r\n");
+        while (tok.next()) |pkg| {
+            try packages.append(allocator, pkg);
+        }
+        if (packages.items.len == 0) break;
+
+        pass += 1;
+        sectionFmt("orphaned dependencies (pass {d}): {d}", .{ pass, packages.items.len });
+        for (packages.items) |pkg| {
+            progressLine("orphan", pkg, 0, 0);
+        }
+
+        var pac_args = try allocator.alloc([]const u8, 2 + packages.items.len);
+        defer allocator.free(pac_args);
+        pac_args[0] = "-Rns";
+        pac_args[1] = "--";
+        @memcpy(pac_args[2..], packages.items);
+
+        if (config.dry_run) {
+            printDryRunCommand("sudo pacman", pac_args);
+            return;
+        }
+
+        const rc = try runPacmanSudoMaybe(allocator, config, pac_args);
+        if (rc != 0) {
+            setFailureContext("remove orphaned dependencies", "pacman", "sudo pacman -Rns -- <packages>", "Resolve dependency/conflict prompts and rerun");
+            return error.PacmanInstallFailed;
+        }
+        total_removed += packages.items.len;
+    }
+
+    if (total_removed == 0) {
+        okLine("no orphaned dependencies found");
+        return;
+    }
+    okLineFmt("removed {d} orphaned dependency package(s) across {d} pass(es)", .{ total_removed, pass });
+}
+
 fn showOptionalDeps(allocator: Allocator, srcinfo: []const u8, pkg: []const u8) void {
     var has_optdeps = false;
     var it = std.mem.splitScalar(u8, srcinfo, '\n');
@@ -1013,6 +1088,7 @@ fn installAurPackageRecursive(allocator: Allocator, ctx: *InstallContext, pkg: [
         return error.NotFound;
     };
     defer allocator.free(repo_base);
+    aurStepLine(repo_base, if (is_dependency) "dependency" else "target", "prepare");
 
     if (ctx.installed_aur.contains(repo_base)) return;
     if (ctx.visiting_aur.contains(repo_base)) {
@@ -1032,6 +1108,7 @@ fn installAurPackageRecursive(allocator: Allocator, ctx: *InstallContext, pkg: [
 
     const cache_root = try melonCacheRoot(allocator);
     defer allocator.free(cache_root);
+    aurStepLine(repo_base, if (is_dependency) "dependency" else "target", "sync cache");
     const repo_sync = try ensureAurRepoCacheSynced(allocator, cache_root, repo_base);
     defer allocator.free(repo_sync.repo_dir);
     defer if (repo_sync.reviewed_from) |c| allocator.free(c);
@@ -1060,8 +1137,10 @@ fn installAurPackageRecursive(allocator: Allocator, ctx: *InstallContext, pkg: [
     const srcinfo = try generateSrcinfo(allocator, ctx.config, build_dir, repo_base);
     defer allocator.free(srcinfo);
 
+    aurStepLine(repo_base, if (is_dependency) "dependency" else "target", "resolve dependencies");
     try resolveAurDependencies(allocator, ctx, srcinfo);
     if (!g_json_output) showOptionalDeps(allocator, srcinfo, pkg);
+    aurStepLine(repo_base, if (is_dependency) "dependency" else "target", "review/build");
     try reviewAurPackage(allocator, ctx, build_dir, pkg, repo_base, srcinfo, repo_sync.reviewed_from);
     if (ctx.config.savechanges) try savePkgbuildReviewChanges(allocator, build_dir, repo_base);
 
@@ -1088,18 +1167,27 @@ fn installAurPackageRecursive(allocator: Allocator, ctx: *InstallContext, pkg: [
             for (built_pkg_paths) |pkg_path| {
                 try ctx.pending_pkg_paths.append(allocator, try allocator.dupe(u8, pkg_path));
             }
+            aurStepLine(repo_base, if (is_dependency) "dependency" else "target", "queued for batch install");
         } else {
             try installBuiltPackages(allocator, ctx.config, built_pkg_paths);
+            aurStepLine(repo_base, if (is_dependency) "dependency" else "target", "installed package");
         }
     }
 
     removeStringSetEntryAndFreeKey(ctx.allocator, &ctx.visiting_aur, repo_base);
     try ctx.installed_aur.put(try ctx.allocator.dupe(u8, repo_base), {});
     g_run_summary.aur_installed += 1;
+    aurStepLine(repo_base, if (is_dependency) "dependency" else "target", "done");
     if (keep_build_dir) warnLineFmt("keeping build dir: {s}", .{build_dir});
 }
 
 fn resolveAurDependencies(allocator: Allocator, ctx: *InstallContext, srcinfo: []const u8) anyerror!void {
+    var deps_seen = std.StringHashMap(void).init(allocator);
+    defer deps_seen.deinit();
+
+    var deps: std.ArrayListUnmanaged([]const u8) = .{};
+    defer deps.deinit(allocator);
+
     var it = std.mem.splitScalar(u8, srcinfo, '\n');
     while (it.next()) |line| {
         const trimmed = std.mem.trim(u8, line, " \t\r");
@@ -1109,8 +1197,50 @@ fn resolveAurDependencies(allocator: Allocator, ctx: *InstallContext, srcinfo: [
         const raw = std.mem.trim(u8, trimmed[eq + 1 ..], " \t");
         const dep = dependencyBaseName(raw);
         if (dep.len == 0) continue;
+        if (deps_seen.contains(dep)) continue;
+        try deps_seen.put(dep, {});
+        try deps.append(allocator, dep);
+    }
+
+    if (deps.items.len == 0) return;
+
+    var repo_deps: std.ArrayListUnmanaged([]const u8) = .{};
+    defer repo_deps.deinit(allocator);
+
+    for (deps.items) |dep| {
+        if (try isDependencySatisfied(allocator, dep)) continue;
+        if (try isOfficialPackage(allocator, dep)) {
+            try repo_deps.append(allocator, dep);
+        }
+    }
+
+    if (repo_deps.items.len > 0) {
+        try installOfficialDependenciesBatch(allocator, ctx, repo_deps.items);
+    }
+
+    for (deps.items) |dep| {
+        if (try isDependencySatisfied(allocator, dep)) continue;
         try ensureDependencyInstalled(allocator, ctx, dep);
     }
+}
+
+fn installOfficialDependenciesBatch(allocator: Allocator, ctx: *InstallContext, deps: []const []const u8) !void {
+    sectionFmt("install {d} dependencies from repos", .{deps.len});
+
+    const args_len = 2 + deps.len;
+    var pac_args = try allocator.alloc([]const u8, args_len);
+    defer allocator.free(pac_args);
+    pac_args[0] = "-S";
+    pac_args[1] = "--needed";
+    @memcpy(pac_args[2..], deps);
+
+    const rc = try runPacmanSudoMaybe(allocator, ctx.config, pac_args);
+    if (rc != 0) {
+        warnLine("bulk repo dependency install failed; retrying dependency resolution one-by-one");
+        return;
+    }
+
+    if (ctx.config.installdebug) try installDebugCompanions(allocator, ctx.config, deps);
 }
 
 fn ensureDependencyInstalled(allocator: Allocator, ctx: *InstallContext, dep: []const u8) anyerror!void {
@@ -2313,7 +2443,16 @@ fn phaseLine(name: []const u8, idx: usize, total: usize) void {
 
 fn progressLine(kind: []const u8, item: []const u8, idx: usize, total: usize) void {
     if (g_json_output) return;
+    if (idx == 0 and total == 0) {
+        std.debug.print("{s}[{s}]{s} {s}\n", .{ color_dim, kind, color_reset, item });
+        return;
+    }
     std.debug.print("{s}[{s} {d}/{d}]{s} {s}\n", .{ color_dim, kind, idx, total, color_reset, item });
+}
+
+fn aurStepLine(repo_base: []const u8, mode: []const u8, step: []const u8) void {
+    if (g_json_output) return;
+    std.debug.print("{s}[aur/{s}]{s} {s}: {s}\n", .{ color_dim, repo_base, color_reset, mode, step });
 }
 
 fn setFailureContext(step: []const u8, package: []const u8, command: []const u8, hint: []const u8) void {

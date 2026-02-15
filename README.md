@@ -15,6 +15,7 @@
 - `melon -S [options] <targets...>`: install targets (repo first, AUR fallback).
 - `melon -Syu`: full system upgrade + AUR upgrades (best-effort AUR continuation if repo sync fails).
 - `melon -Sua`: upgrade only installed AUR/foreign packages.
+- `melon -Cbd`: prune all unused dependency packages (`pacman -Qtdq` + `pacman -Rns`, repeated until clean).
 - `melon -Qm`: list foreign packages.
 - `melon <pacman flags...>`: passthrough for non-overridden pacman operations.
 
@@ -113,6 +114,7 @@ zig build run -- --dry-run -Syu
 zig build run -- --json -Sua
 zig build run -- --cache-info
 zig build run -- --resume-failed
+zig build run -- -Cbd
 ```
 
 ## Runtime dependencies
