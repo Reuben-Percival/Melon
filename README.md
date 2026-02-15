@@ -1,4 +1,4 @@
-# melon
+# Melon
 
 `melon` is a Zig-based AUR helper for Arch Linux focused on explicit review, resilient upgrades, and clear terminal UX.
 
