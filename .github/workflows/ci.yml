@@ -52,41 +52,6 @@ jobs:
           zig build test
           echo "::endgroup::"
 
-  compatibility:
-    name: Compatibility (Zig ${{ matrix.zig-version }})
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
-    strategy:
-      fail-fast: false
-      matrix:
-        zig-version:
-          - 0.13.0
-    env:
-      ZIG_GLOBAL_CACHE_DIR: ${{ github.workspace }}/.zig-global-cache
-      ZIG_LOCAL_CACHE_DIR: ${{ github.workspace }}/.zig-local-cache
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Setup Zig
-        uses: mlugg/setup-zig@v2
-        with:
-          version: ${{ matrix.zig-version }}
-
-      - name: Build and test
-        shell: bash
-        run: |
-          set -euo pipefail
-          echo "::group::Environment"
-          zig version
-          echo "::endgroup::"
-          echo "::group::Build"
-          zig build
-          echo "::endgroup::"
-          echo "::group::Unit tests"
-          zig build test
-          echo "::endgroup::"
-
   arch-linux:
     name: Arch Linux build (pacman)
     runs-on: ubuntu-latest
