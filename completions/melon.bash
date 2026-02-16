@@ -8,7 +8,7 @@ _melon() {
     prev="${COMP_WORDS[COMP_CWORD-1]}"
 
     # Core commands
-    commands="-S -Ss -Si -Qs -Syu -Sua -Qu -Qua -Qm -G -Sc -Scc -R -Rns -h --help"
+    commands="-S -Ss -Si -Qs -Syu -Sua -Qu -Qua -Qm -G -Sc -Scc -Cbd -R -Rns -h --help"
 
     # Melon-specific options
     opts="--version --dry-run --json --color=auto --color=always --color=never

@@ -13,6 +13,7 @@ complete -c melon -f -n '__fish_use_subcommand' -a '-Qm' -d 'List foreign packag
 complete -c melon -f -n '__fish_use_subcommand' -a '-G' -d 'Clone AUR package repo(s)'
 complete -c melon -f -n '__fish_use_subcommand' -a '-Sc' -d 'Clean pacman + melon info cache'
 complete -c melon -f -n '__fish_use_subcommand' -a '-Scc' -d 'Deep clean all caches'
+complete -c melon -f -n '__fish_use_subcommand' -a '-Cbd' -d 'Prune all unused dependency packages'
 
 # Package name completion for -S, -Si, -G
 function __melon_list_packages
