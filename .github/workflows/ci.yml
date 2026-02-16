@@ -123,6 +123,33 @@ jobs:
           PREFIX="${PREFIX}" ./uninstall.sh
           test ! -e "${PREFIX}/bin/melon"
 
+  integration-logic:
+    name: Integration logic (fixture harness)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    needs: checks
+    env:
+      ZIG_GLOBAL_CACHE_DIR: ${{ github.workspace }}/.zig-global-cache
+      ZIG_LOCAL_CACHE_DIR: ${{ github.workspace }}/.zig-local-cache
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.15.2
+
+      - name: Build binary
+        run: |
+          set -euo pipefail
+          zig build -Doptimize=ReleaseSafe
+
+      - name: Run fixture integration harness
+        run: |
+          set -euo pipefail
+          ./scripts/integration-aur.sh
+
   arch-linux:
     name: Arch Linux build (pacman)
     runs-on: ubuntu-latest
