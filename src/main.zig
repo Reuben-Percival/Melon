@@ -52,6 +52,7 @@ const InstallContext = struct {
     reviewed_aur: std.StringHashMap(void),
     aur_info_cache: std.StringHashMap([]u8),
     aur_pkgbuild_diffs: std.StringHashMap([]u8),
+    aur_build_dirs: std.StringHashMap([]u8),
     pending_pkg_paths: std.ArrayListUnmanaged([]u8),
     local_repo_dir: ?[]u8,
     skip_remaining_reviews: bool,
@@ -65,6 +66,7 @@ const InstallContext = struct {
             .reviewed_aur = std.StringHashMap(void).init(allocator),
             .aur_info_cache = std.StringHashMap([]u8).init(allocator),
             .aur_pkgbuild_diffs = std.StringHashMap([]u8).init(allocator),
+            .aur_build_dirs = std.StringHashMap([]u8).init(allocator),
             .pending_pkg_paths = .{},
             .local_repo_dir = null,
             .skip_remaining_reviews = false,
@@ -77,6 +79,14 @@ const InstallContext = struct {
         freeStringSetKeys(self.allocator, &self.reviewed_aur);
         freeStringToOwnedSliceMap(self.allocator, &self.aur_info_cache);
         freeStringToOwnedSliceMap(self.allocator, &self.aur_pkgbuild_diffs);
+        var build_it = self.aur_build_dirs.iterator();
+        while (build_it.next()) |entry| {
+            if (!self.config.keepsrc and !self.config.savechanges) {
+                std.fs.deleteTreeAbsolute(entry.value_ptr.*) catch {};
+            }
+            self.allocator.free(entry.key_ptr.*);
+            self.allocator.free(entry.value_ptr.*);
+        }
         for (self.pending_pkg_paths.items) |path| self.allocator.free(path);
         self.pending_pkg_paths.deinit(self.allocator);
         if (self.local_repo_dir) |p| self.allocator.free(p);
@@ -85,6 +95,7 @@ const InstallContext = struct {
         self.reviewed_aur.deinit();
         self.aur_info_cache.deinit();
         self.aur_pkgbuild_diffs.deinit();
+        self.aur_build_dirs.deinit();
     }
 };
 
@@ -1091,7 +1102,24 @@ fn installAurPackageRecursive(allocator: Allocator, ctx: *InstallContext, pkg: [
     defer allocator.free(repo_base);
     aurStepLine(repo_base, if (is_dependency) "dependency" else "target", "prepare");
 
-    if (ctx.installed_aur.contains(repo_base)) return;
+    if (ctx.installed_aur.contains(repo_base)) {
+        if (try isInstalledPackage(allocator, pkg)) return;
+        if (ctx.aur_build_dirs.get(repo_base)) |cached_build_dir| {
+            sectionFmt("reuse built artifacts for aur/{s}", .{repo_base});
+            const built_pkg_paths = try listBuiltPackageFiles(allocator, cached_build_dir);
+            defer freeNameList(allocator, built_pkg_paths);
+            const requested_pkg_paths = try selectBuiltPackageFilesForTargets(allocator, built_pkg_paths, &.{pkg});
+            defer allocator.free(requested_pkg_paths);
+            if (requested_pkg_paths.len == 0) {
+                setFailureContext("aur package select", pkg, "select built package artifacts", "Requested split package artifact not found");
+                return error.NotFound;
+            }
+            try installBuiltPackages(allocator, ctx.config, requested_pkg_paths);
+            aurStepLine(repo_base, if (is_dependency) "dependency" else "target", "installed package");
+            return;
+        }
+        return;
+    }
     if (ctx.visiting_aur.contains(repo_base)) {
         errLineFmt("dependency cycle detected at aur/{s}", .{repo_base});
         return error.DependencyCycle;
@@ -1123,8 +1151,9 @@ fn installAurPackageRecursive(allocator: Allocator, ctx: *InstallContext, pkg: [
 
     const build_dir = try createSecureBuildDir(allocator, repo_base);
     defer allocator.free(build_dir);
+    var persist_build_dir_for_run = false;
     const keep_build_dir = ctx.config.keepsrc or ctx.config.savechanges;
-    defer if (!keep_build_dir) std.fs.deleteTreeAbsolute(build_dir) catch {};
+    defer if (!keep_build_dir and !persist_build_dir_for_run) std.fs.deleteTreeAbsolute(build_dir) catch {};
     try std.fs.makeDirAbsolute(build_dir);
     const repo_contents_path = try std.fmt.allocPrint(allocator, "{s}/.", .{repo_sync.repo_dir});
     defer allocator.free(repo_contents_path);
@@ -1152,26 +1181,39 @@ fn installAurPackageRecursive(allocator: Allocator, ctx: *InstallContext, pkg: [
         }
     }
 
-    const use_noinstall = ctx.config.chroot or
-        ((ctx.config.localrepo or ctx.config.batchinstall) and !is_dependency);
-    const built_pkg_paths = try buildAurPackage(allocator, ctx.config, build_dir, repo_base, use_noinstall);
+    const built_pkg_paths = try buildAurPackage(allocator, ctx.config, build_dir, repo_base);
     defer freeNameList(allocator, built_pkg_paths);
+    if (built_pkg_paths.len == 0) {
+        setFailureContext("aur package discovery", repo_base, "find built package files", "Build produced no package artifacts");
+        return error.MakepkgFailed;
+    }
 
-    if (use_noinstall) {
-        if (built_pkg_paths.len == 0) {
-            setFailureContext("aur package discovery", repo_base, "find built package files", "Build produced no package artifacts");
-            return error.MakepkgFailed;
+    if (ctx.aur_build_dirs.fetchRemove(repo_base)) |old| {
+        if (!ctx.config.keepsrc and !ctx.config.savechanges) {
+            std.fs.deleteTreeAbsolute(old.value) catch {};
         }
-        if (ctx.config.localrepo) try addPackagesToLocalRepo(allocator, ctx, built_pkg_paths);
-        if (ctx.config.batchinstall and !is_dependency) {
-            for (built_pkg_paths) |pkg_path| {
-                try ctx.pending_pkg_paths.append(allocator, try allocator.dupe(u8, pkg_path));
-            }
-            aurStepLine(repo_base, if (is_dependency) "dependency" else "target", "queued for batch install");
-        } else {
-            try installBuiltPackages(allocator, ctx.config, built_pkg_paths);
-            aurStepLine(repo_base, if (is_dependency) "dependency" else "target", "installed package");
+        allocator.free(old.key);
+        allocator.free(old.value);
+    }
+    try ctx.aur_build_dirs.put(try allocator.dupe(u8, repo_base), try allocator.dupe(u8, build_dir));
+    persist_build_dir_for_run = true;
+
+    const requested_pkg_paths = try selectBuiltPackageFilesForTargets(allocator, built_pkg_paths, &.{pkg});
+    defer allocator.free(requested_pkg_paths);
+    if (requested_pkg_paths.len == 0) {
+        setFailureContext("aur package select", pkg, "select built package artifacts", "Requested split package artifact not found");
+        return error.NotFound;
+    }
+
+    if (ctx.config.localrepo) try addPackagesToLocalRepo(allocator, ctx, built_pkg_paths);
+    if (ctx.config.batchinstall and !is_dependency) {
+        for (requested_pkg_paths) |pkg_path| {
+            try ctx.pending_pkg_paths.append(allocator, try allocator.dupe(u8, pkg_path));
         }
+        aurStepLine(repo_base, if (is_dependency) "dependency" else "target", "queued for batch install");
+    } else {
+        try installBuiltPackages(allocator, ctx.config, requested_pkg_paths);
+        aurStepLine(repo_base, if (is_dependency) "dependency" else "target", "installed package");
     }
 
     removeStringSetEntryAndFreeKey(ctx.allocator, &ctx.visiting_aur, repo_base);
@@ -1323,7 +1365,7 @@ fn reviewAurPackage(allocator: Allocator, ctx: *InstallContext, build_dir: []con
     std.debug.print("  1) View PKGBUILD\n", .{});
     std.debug.print("  2) View dependency summary\n", .{});
     std.debug.print("  3) View full .SRCINFO\n", .{});
-    std.debug.print("  4) View PKGBUILD diff (if upgraded)\n", .{});
+    std.debug.print("  4) View source diff (PKGBUILD/.install/.patch/etc)\n", .{});
     std.debug.print("  5) Run PKGBUILD security check\n", .{});
     std.debug.print("  c) Continue build\n", .{});
     std.debug.print("  a) Continue and trust all for this run\n", .{});
@@ -1350,15 +1392,15 @@ fn reviewAurPackage(allocator: Allocator, ctx: *InstallContext, build_dir: []con
         if (eql(choice, "4")) {
             if (ctx.aur_pkgbuild_diffs.get(repo_base)) |diff| {
                 if (std.mem.trim(u8, diff, " \t\r\n").len == 0) {
-                    warnLine("no PKGBUILD changes detected");
+                    warnLine("no tracked source changes detected");
                 } else {
-                    std.debug.print("\n{s}PKGBUILD diff{s}\n", .{ color_title, color_reset });
+                    std.debug.print("\n{s}Source diff{s}\n", .{ color_title, color_reset });
                     rule();
                     std.debug.print("{s}\n", .{diff});
                     rule();
                 }
             } else {
-                warnLine("no previous PKGBUILD snapshot available");
+                warnLine("no previous source snapshot available");
             }
             continue;
         }
@@ -1834,14 +1876,14 @@ fn ensureAurRepoCacheSynced(allocator: Allocator, cache_root: []const u8, repo_b
     const reviewed_commit = try readReviewedCommit(allocator, cache_root, repo_base);
     defer if (reviewed_commit) |c| allocator.free(c);
     if (reviewed_commit != null and !eql(reviewed_commit.?, new_head.?)) {
-        const diff_reviewed = runCapture(allocator, &.{ "git", "-C", repo_dir, "diff", reviewed_commit.?, new_head.?, "--", "PKGBUILD" }) catch null;
+        const diff_reviewed = runCapture(allocator, &.{ "git", "-C", repo_dir, "diff", reviewed_commit.?, new_head.?, "--", "." }) catch null;
         return .{ .repo_dir = repo_dir, .pkgbuild_diff = diff_reviewed, .reviewed_from = try allocator.dupe(u8, reviewed_commit.?) };
     }
 
     if (old_head == null or eql(old_head.?, new_head.?)) {
         return .{ .repo_dir = repo_dir, .pkgbuild_diff = null, .reviewed_from = null };
     }
-    const diff = runCapture(allocator, &.{ "git", "-C", repo_dir, "diff", old_head.?, new_head.?, "--", "PKGBUILD" }) catch null;
+    const diff = runCapture(allocator, &.{ "git", "-C", repo_dir, "diff", old_head.?, new_head.?, "--", "." }) catch null;
     return .{ .repo_dir = repo_dir, .pkgbuild_diff = diff, .reviewed_from = null };
 }
 
@@ -2145,7 +2187,7 @@ fn generateSrcinfo(allocator: Allocator, config: RunConfig, build_dir: []const u
     };
 }
 
-fn buildAurPackage(allocator: Allocator, config: RunConfig, build_dir: []const u8, repo_base: []const u8, noinstall: bool) ![]const []const u8 {
+fn buildAurPackage(allocator: Allocator, config: RunConfig, build_dir: []const u8, repo_base: []const u8) ![]const []const u8 {
     if (config.chroot) {
         const have_chroot = (runStatus(allocator, null, &.{ "sh", "-lc", "command -v extra-x86_64-build >/dev/null 2>&1" }) catch 1) == 0;
         if (!have_chroot) {
@@ -2167,17 +2209,12 @@ fn buildAurPackage(allocator: Allocator, config: RunConfig, build_dir: []const u
     try args.append(allocator, "--noconfirm");
     if (!config.pgpfetch) try args.append(allocator, "--skippgpcheck");
     if (config.sign) try args.append(allocator, "--sign");
-    if (noinstall) {
-        try args.append(allocator, "--noinstall");
-    } else {
-        try args.append(allocator, "-i");
-    }
+    try args.append(allocator, "--noinstall");
     const mk_rc = try runStreamingCwd(allocator, build_dir, args.items);
     if (mk_rc != 0) {
         setFailureContext("aur build", repo_base, "makepkg -s ...", "Review PKGBUILD and rerun with --resume-failed");
         return error.MakepkgFailed;
     }
-    if (!noinstall) return allocator.alloc([]const u8, 0);
     return listBuiltPackageFiles(allocator, build_dir);
 }
 
@@ -2195,6 +2232,40 @@ fn listBuiltPackageFiles(allocator: Allocator, build_dir: []const u8) ![]const [
         try out.append(allocator, full);
     }
     return out.toOwnedSlice(allocator);
+}
+
+fn selectBuiltPackageFilesForTargets(allocator: Allocator, pkg_paths: []const []const u8, targets: []const []const u8) ![]const []const u8 {
+    var selected: std.ArrayListUnmanaged([]const u8) = .{};
+    defer selected.deinit(allocator);
+
+    for (pkg_paths) |pkg_path| {
+        const pkg_name = builtPackageNameFromPath(pkg_path) orelse continue;
+        for (targets) |target| {
+            if (!eql(pkg_name, target)) continue;
+            try selected.append(allocator, pkg_path);
+            break;
+        }
+    }
+
+    if (selected.items.len == 0 and pkg_paths.len == 1) {
+        try selected.append(allocator, pkg_paths[0]);
+    }
+    return selected.toOwnedSlice(allocator);
+}
+
+fn builtPackageNameFromPath(pkg_path: []const u8) ?[]const u8 {
+    const file_name = std.fs.path.basename(pkg_path);
+    const pkg_tar_idx = std.mem.indexOf(u8, file_name, ".pkg.tar") orelse return null;
+    var stem = file_name[0..pkg_tar_idx];
+
+    const arch_idx = std.mem.lastIndexOfScalar(u8, stem, '-') orelse return null;
+    stem = stem[0..arch_idx];
+    const rel_idx = std.mem.lastIndexOfScalar(u8, stem, '-') orelse return null;
+    stem = stem[0..rel_idx];
+    const ver_idx = std.mem.lastIndexOfScalar(u8, stem, '-') orelse return null;
+    const pkg_name = stem[0..ver_idx];
+    if (pkg_name.len == 0) return null;
+    return pkg_name;
 }
 
 fn installBuiltPackages(allocator: Allocator, config: RunConfig, pkg_paths: []const []const u8) !void {
@@ -2712,4 +2783,25 @@ test "collectLocalProvidedNames includes split package names and virtual provide
     try std.testing.expect(local_provides.contains("demo-tools"));
     try std.testing.expect(local_provides.contains("demo-common"));
     try std.testing.expect(local_provides.contains("demo-virtual"));
+}
+
+test "builtPackageNameFromPath extracts package name" {
+    const path = "/tmp/build/nxagent-3.5.99.26-1-x86_64.pkg.tar.zst";
+    const pkg = builtPackageNameFromPath(path);
+    try std.testing.expect(pkg != null);
+    try std.testing.expectEqualStrings("nxagent", pkg.?);
+}
+
+test "selectBuiltPackageFilesForTargets keeps only requested split outputs" {
+    const allocator = std.testing.allocator;
+    const pkg_paths = [_][]const u8{
+        "/tmp/build/nxproxy-3.5.99.26-1-x86_64.pkg.tar.zst",
+        "/tmp/build/nxagent-3.5.99.26-1-x86_64.pkg.tar.zst",
+    };
+
+    const selected = try selectBuiltPackageFilesForTargets(allocator, pkg_paths[0..], &.{"nxagent"});
+    defer allocator.free(selected);
+
+    try std.testing.expectEqual(@as(usize, 1), selected.len);
+    try std.testing.expectEqualStrings(pkg_paths[1], selected[0]);
 }
