@@ -2583,7 +2583,7 @@ fn progressLine(kind: []const u8, item: []const u8, idx: usize, total: usize) vo
         std.debug.print("{s}[{s}]{s} {s}\n", .{ color_dim, kind, color_reset, item });
         return;
     }
-    std.debug.print("{s}[{s} {d}/{d}]{s} {s}\n", .{ color_dim, kind, idx, total, color_reset, item });
+    std.debug.print("{s}[{d}/{d}]{s} {s}: {s}\n", .{ color_dim, idx, total, color_reset, kind, item });
 }
 
 fn aurStepLine(repo_base: []const u8, mode: []const u8, step: []const u8) void {
