@@ -288,3 +288,8 @@ test "parseCliArgs recognizes and strips toggle flags" {
     try std.testing.expect(parsed.config.signdb);
     try std.testing.expect(!parsed.config.localrepo);
 }
+
+test "dependencyBaseName handles arch qualifiers and epochs" {
+    try std.testing.expectEqualStrings("zlib", dependencyBaseName("zlib: x86_64"));
+    try std.testing.expectEqualStrings("openssl", dependencyBaseName("openssl=3:3.2.1-1"));
+}

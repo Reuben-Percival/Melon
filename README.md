@@ -50,11 +50,11 @@
 
 Before each AUR build, melon requires a review step (unless explicitly bypassed):
 
-- `1` View raw `PKGBUILD` (classic pager view).
+- `1` File review: view raw `PKGBUILD` (classic pager view).
 - `2` View dependency summary.
 - `3` View full `.SRCINFO`.
-- `4` View `PKGBUILD` diff since last reviewed commit (when available).
-- `5` Run PKGBUILD security check (capability/risk summary).
+- `4` Diff view: `PKGBUILD` diff since last reviewed commit (when available).
+- `5` Run PKGBUILD security check (capability/risk summary + unsafe makepkg flag detection like `!strip`, `!check`, `!fortify`, etc).
 - `c` Continue build.
 - `a` Continue and trust remaining builds for this run.
 - `q` Abort.
@@ -64,6 +64,9 @@ Security check (`5`) is required before `c`/`a` for that review prompt.
 ## Resilience and safety behavior
 
 - Recursive AUR dependency resolution (`depends`, `makedepends`, `checkdepends`).
+- Split package aware dependency solving:
+  - tracks `pkgname` and `provides` from `.SRCINFO`
+  - avoids false dependency cycles when split outputs depend on each other within the same `pkgbase`
 - Best-effort fallback when official repo operations fail:
   - `-S`: attempts AUR fallback for requested targets.
   - dependency installs: tries AUR if repo dependency install fails.
@@ -85,6 +88,14 @@ Security check (`5`) is required before `c`/`a` for that review prompt.
   - failures
   - cache hits/misses
   - elapsed time
+
+## Shell completions
+
+- Completions are shipped for:
+  - bash (`completions/melon.bash`)
+  - zsh (`completions/melon.zsh`)
+  - fish (`completions/melon.fish`)
+- Installed automatically by `install.sh` into standard completion paths.
 
 ## Build and test
 

@@ -635,8 +635,9 @@ fn searchPackages(allocator: Allocator, config: RunConfig, query: []const u8) !v
                 color_title, display_num, color_reset, r.name, r.version,
             });
             std.debug.print("{s}{s}{s} {s}(+{d} {d:.2}){s}\n", .{
-                color_err, ood, color_reset,
-                color_dim, r.votes, r.popularity, color_reset,
+                color_err,   ood,     color_reset,
+                color_dim,   r.votes, r.popularity,
+                color_reset,
             });
             if (r.desc.len > 0) std.debug.print("     {s}{s}{s}\n", .{ color_dim, r.desc, color_reset });
         }
@@ -919,9 +920,9 @@ fn checkUpdates(allocator: Allocator, config: RunConfig, aur_only: bool) !void {
                 std.debug.print("{{\"name\":\"{s}\",\"current\":\"{s}\",\"latest\":\"{s}\"}}", .{ pkg, installed, latest });
             } else {
                 std.debug.print("{s}{s}{s} {s} -> {s}{s}{s}\n", .{
-                    color_warn, pkg, color_reset,
-                    installed,
-                    color_ok,   latest, color_reset,
+                    color_warn,  pkg,      color_reset,
+                    installed,   color_ok, latest,
+                    color_reset,
                 });
             }
         }
@@ -1094,7 +1095,6 @@ fn installAurPackageRecursive(allocator: Allocator, ctx: *InstallContext, pkg: [
     if (ctx.visiting_aur.contains(repo_base)) {
         errLineFmt("dependency cycle detected at aur/{s}", .{repo_base});
         return error.DependencyCycle;
-
     }
     try ctx.visiting_aur.put(try ctx.allocator.dupe(u8, repo_base), {});
     errdefer removeStringSetEntryAndFreeKey(ctx.allocator, &ctx.visiting_aur, repo_base);
@@ -1182,8 +1182,17 @@ fn installAurPackageRecursive(allocator: Allocator, ctx: *InstallContext, pkg: [
 }
 
 fn resolveAurDependencies(allocator: Allocator, ctx: *InstallContext, srcinfo: []const u8) anyerror!void {
+    var local_provides = try collectLocalProvidedNames(allocator, srcinfo);
+    defer {
+        freeStringSetKeys(allocator, &local_provides);
+        local_provides.deinit();
+    }
+
     var deps_seen = std.StringHashMap(void).init(allocator);
-    defer deps_seen.deinit();
+    defer {
+        freeStringSetKeys(allocator, &deps_seen);
+        deps_seen.deinit();
+    }
 
     var deps: std.ArrayListUnmanaged([]const u8) = .{};
     defer deps.deinit(allocator);
@@ -1197,8 +1206,9 @@ fn resolveAurDependencies(allocator: Allocator, ctx: *InstallContext, srcinfo: [
         const raw = std.mem.trim(u8, trimmed[eq + 1 ..], " \t");
         const dep = dependencyBaseName(raw);
         if (dep.len == 0) continue;
+        if (local_provides.contains(dep)) continue;
         if (deps_seen.contains(dep)) continue;
-        try deps_seen.put(dep, {});
+        try deps_seen.put(try allocator.dupe(u8, dep), {});
         try deps.append(allocator, dep);
     }
 
@@ -1222,6 +1232,28 @@ fn resolveAurDependencies(allocator: Allocator, ctx: *InstallContext, srcinfo: [
         if (try isDependencySatisfied(allocator, dep)) continue;
         try ensureDependencyInstalled(allocator, ctx, dep);
     }
+}
+
+fn collectLocalProvidedNames(allocator: Allocator, srcinfo: []const u8) !std.StringHashMap(void) {
+    var local_provides = std.StringHashMap(void).init(allocator);
+    errdefer {
+        freeStringSetKeys(allocator, &local_provides);
+        local_provides.deinit();
+    }
+
+    var it = std.mem.splitScalar(u8, srcinfo, '\n');
+    while (it.next()) |line| {
+        const trimmed = std.mem.trim(u8, line, " \t\r");
+        if (!startsWithAny(trimmed, &.{ "pkgname = ", "provides = " })) continue;
+
+        const eq = std.mem.indexOfScalar(u8, trimmed, '=') orelse continue;
+        const raw = std.mem.trim(u8, trimmed[eq + 1 ..], " \t");
+        const dep = dependencyBaseName(raw);
+        if (dep.len == 0 or local_provides.contains(dep)) continue;
+        try local_provides.put(try allocator.dupe(u8, dep), {});
+    }
+
+    return local_provides;
 }
 
 fn installOfficialDependenciesBatch(allocator: Allocator, ctx: *InstallContext, deps: []const []const u8) !void {
@@ -1393,6 +1425,17 @@ fn runPkgbuildSecurityCheck(allocator: Allocator, build_dir: []const u8) !void {
     std.debug.print("  - Network/download indicators: {s}\n", .{if (analysis.network) "present" else "not obvious"});
     std.debug.print("  - File mutation indicators: {s}\n", .{if (analysis.file_mutation) "present" else "not obvious"});
     std.debug.print("  - Service/system mutation indicators: {s}\n", .{if (analysis.system_mutation) "present" else "not obvious"});
+    if (analysis.unsafe_flag_count > 0) {
+        std.debug.print("  - Unsafe makepkg option flags ({d}): ", .{analysis.unsafe_flag_count});
+        for (analysis.unsafe_flags, 0..) |flag, idx| {
+            if (idx >= analysis.unsafe_flag_count) break;
+            if (idx > 0) std.debug.print(", ", .{});
+            std.debug.print("{s}", .{flag});
+        }
+        std.debug.print("\n", .{});
+    } else {
+        std.debug.print("  - Unsafe makepkg option flags: none detected\n", .{});
+    }
     if (analysis.risky_count > 0) {
         std.debug.print("  - Risky command markers ({d}): ", .{analysis.risky_count});
         for (analysis.risky_markers, 0..) |marker, idx| {
@@ -1411,15 +1454,37 @@ const PkgbuildAnalysis = struct {
     network: bool = false,
     file_mutation: bool = false,
     system_mutation: bool = false,
+    unsafe_flags: [16][]const u8 = [_][]const u8{""} ** 16,
+    unsafe_flag_count: usize = 0,
     risky_markers: [16][]const u8 = [_][]const u8{""} ** 16,
     risky_count: usize = 0,
 };
 
 fn analyzePkgbuildCapabilities(body: []const u8) PkgbuildAnalysis {
     var out = PkgbuildAnalysis{};
+    const unsafe_flag_candidates = [_][]const u8{
+        "!strip",
+        "!check",
+        "!debug",
+        "!lto",
+        "!fortify",
+        "!buildflags",
+        "!makeflags",
+        "!distcc",
+        "!ccache",
+    };
+    for (unsafe_flag_candidates) |flag| {
+        if (std.mem.indexOf(u8, body, flag) == null) continue;
+        if (out.unsafe_flag_count < out.unsafe_flags.len) {
+            out.unsafe_flags[out.unsafe_flag_count] = flag;
+            out.unsafe_flag_count += 1;
+        }
+    }
+
     const candidates = [_][]const u8{
-        "curl", "wget", "git clone", "rm -", "chmod", "chown", "install ",
-        "cp ", "mv ", "systemctl", "sudo", "mount ", "dd ", "mkfs", "tee ",
+        "curl", "wget", "git clone", "rm -", "chmod",  "chown", "install ",
+        "cp ",  "mv ",  "systemctl", "sudo", "mount ", "dd ",   "mkfs",
+        "tee ",
     };
     for (candidates) |needle| {
         if (std.mem.indexOf(u8, body, needle) != null) {
@@ -2624,4 +2689,27 @@ test "dependencyBaseName strips operators and repo prefixes" {
     try std.testing.expectEqualStrings("openssl", dependencyBaseName("openssl>=3"));
     try std.testing.expectEqualStrings("python", dependencyBaseName("community/python<3.14"));
     try std.testing.expectEqualStrings("", dependencyBaseName("!conflicts-with"));
+}
+
+test "collectLocalProvidedNames includes split package names and virtual provides" {
+    const allocator = std.testing.allocator;
+    const srcinfo =
+        \\pkgbase = demo
+        \\pkgname = demo-lib
+        \\depends = demo-common>=1.0
+        \\pkgname = demo-tools
+        \\provides = demo-common=1.0
+        \\provides = demo-virtual
+    ;
+
+    var local_provides = try collectLocalProvidedNames(allocator, srcinfo);
+    defer {
+        freeStringSetKeys(allocator, &local_provides);
+        local_provides.deinit();
+    }
+
+    try std.testing.expect(local_provides.contains("demo-lib"));
+    try std.testing.expect(local_provides.contains("demo-tools"));
+    try std.testing.expect(local_provides.contains("demo-common"));
+    try std.testing.expect(local_provides.contains("demo-virtual"));
 }

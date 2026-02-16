@@ -29,6 +29,7 @@ _melon() {
         '-G:clone AUR package repo to current directory'
         '-Sc:clean pacman cache + melon info cache'
         '-Scc:deep clean all caches'
+        '-Cbd:prune all unused dependency packages'
     )
 
     melon_opts=(
