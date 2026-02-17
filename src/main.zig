@@ -43,6 +43,11 @@ var g_json_output: bool = false;
 var g_run_summary = RunSummary{};
 var g_failure: ?FailureInfo = null;
 var g_sudoloop_running: bool = false;
+const failure_field_max_len: usize = 256;
+var g_failure_step_buf: [failure_field_max_len]u8 = [_]u8{0} ** failure_field_max_len;
+var g_failure_package_buf: [failure_field_max_len]u8 = [_]u8{0} ** failure_field_max_len;
+var g_failure_command_buf: [failure_field_max_len]u8 = [_]u8{0} ** failure_field_max_len;
+var g_failure_hint_buf: [failure_field_max_len]u8 = [_]u8{0} ** failure_field_max_len;
 
 const InstallContext = struct {
     allocator: Allocator,
@@ -127,14 +132,14 @@ pub fn main() !void {
     if (parsed.config.cache_info) {
         cacheInfo(allocator, parsed.config) catch |err| {
             printFailureReport(err);
-            return err;
+            std.process.exit(1);
         };
         return;
     }
     if (parsed.config.cache_clean) {
         cacheClean(allocator, parsed.config) catch |err| {
             printFailureReport(err);
-            return err;
+            std.process.exit(1);
         };
         return;
     }
@@ -145,7 +150,7 @@ pub fn main() !void {
             g_run_summary.failures += 1;
             printFailureReport(err);
             printSummaryCard();
-            return err;
+            std.process.exit(1);
         };
         printSummaryCard();
         return;
@@ -169,7 +174,7 @@ pub fn main() !void {
         if (parsed.args.len < 2) return usageErr("missing search query");
         searchPackages(allocator, parsed.config, parsed.args[1]) catch |err| {
             printFailureReport(err);
-            return err;
+            std.process.exit(1);
         };
         return;
     }
@@ -177,7 +182,10 @@ pub fn main() !void {
     // -Qs: local search
     if (eql(cmd, "-Qs")) {
         if (parsed.args.len < 2) return usageErr("missing search query");
-        try pacmanPassthrough(allocator, parsed.config, parsed.args);
+        pacmanPassthrough(allocator, parsed.config, parsed.args) catch |err| {
+            printFailureReport(err);
+            std.process.exit(1);
+        };
         return;
     }
 
@@ -186,7 +194,7 @@ pub fn main() !void {
         if (parsed.args.len < 2) return usageErr("missing package name");
         infoPackage(allocator, parsed.args[1]) catch |err| {
             printFailureReport(err);
-            return err;
+            std.process.exit(1);
         };
         return;
     }
@@ -197,7 +205,7 @@ pub fn main() !void {
         for (parsed.args[1..]) |pkg| {
             cloneAurRepo(allocator, pkg) catch |err| {
                 printFailureReport(err);
-                if (parsed.config.failfast) return err;
+                if (parsed.config.failfast) std.process.exit(1);
                 continue;
             };
         }
@@ -208,7 +216,7 @@ pub fn main() !void {
     if (eql(cmd, "-Sc")) {
         cleanCacheLight(allocator, parsed.config) catch |err| {
             printFailureReport(err);
-            return err;
+            std.process.exit(1);
         };
         return;
     }
@@ -217,7 +225,7 @@ pub fn main() !void {
     if (eql(cmd, "-Scc")) {
         cleanCacheDeep(allocator, parsed.config) catch |err| {
             printFailureReport(err);
-            return err;
+            std.process.exit(1);
         };
         return;
     }
@@ -227,7 +235,7 @@ pub fn main() !void {
         startSudoLoop(allocator, parsed.config);
         cleanBuildDependencies(allocator, parsed.config) catch |err| {
             printFailureReport(err);
-            return err;
+            std.process.exit(1);
         };
         return;
     }
@@ -241,7 +249,7 @@ pub fn main() !void {
             g_run_summary.failures += 1;
             printFailureReport(err);
             printSummaryCard();
-            return err;
+            std.process.exit(1);
         };
         printSummaryCard();
         return;
@@ -255,7 +263,7 @@ pub fn main() !void {
             g_run_summary.failures += 1;
             printFailureReport(err);
             printSummaryCard();
-            return err;
+            std.process.exit(1);
         };
         printSummaryCard();
         return;
@@ -269,7 +277,7 @@ pub fn main() !void {
             g_run_summary.failures += 1;
             printFailureReport(err);
             printSummaryCard();
-            return err;
+            std.process.exit(1);
         };
         printSummaryCard();
         return;
@@ -279,7 +287,7 @@ pub fn main() !void {
     if (eql(cmd, "-Qu")) {
         checkUpdates(allocator, parsed.config, false) catch |err| {
             printFailureReport(err);
-            return err;
+            std.process.exit(1);
         };
         return;
     }
@@ -288,7 +296,7 @@ pub fn main() !void {
     if (eql(cmd, "-Qua")) {
         checkUpdates(allocator, parsed.config, true) catch |err| {
             printFailureReport(err);
-            return err;
+            std.process.exit(1);
         };
         return;
     }
@@ -297,14 +305,17 @@ pub fn main() !void {
     if (eql(cmd, "-Qm")) {
         foreignPackages(allocator) catch |err| {
             printFailureReport(err);
-            return err;
+            std.process.exit(1);
         };
         return;
     }
 
     // Passthrough anything else that starts with -
     if (parsed.args[0].len > 0 and parsed.args[0][0] == '-') {
-        try pacmanPassthrough(allocator, parsed.config, parsed.args);
+        pacmanPassthrough(allocator, parsed.config, parsed.args) catch |err| {
+            printFailureReport(err);
+            std.process.exit(1);
+        };
         return;
     }
 
@@ -2209,7 +2220,6 @@ fn buildAurPackage(allocator: Allocator, config: RunConfig, build_dir: []const u
     try args.append(allocator, "--noconfirm");
     if (!config.pgpfetch) try args.append(allocator, "--skippgpcheck");
     if (config.sign) try args.append(allocator, "--sign");
-    try args.append(allocator, "--noinstall");
     const mk_rc = try runStreamingCwd(allocator, build_dir, args.items);
     if (mk_rc != 0) {
         setFailureContext("aur build", repo_base, "makepkg -s ...", "Review PKGBUILD and rerun with --resume-failed");
@@ -2593,11 +2603,17 @@ fn aurStepLine(repo_base: []const u8, mode: []const u8, step: []const u8) void {
 
 fn setFailureContext(step: []const u8, package: []const u8, command: []const u8, hint: []const u8) void {
     g_failure = .{
-        .step = step,
-        .package = package,
-        .command = command,
-        .hint = hint,
+        .step = copyFailureField(&g_failure_step_buf, step),
+        .package = copyFailureField(&g_failure_package_buf, package),
+        .command = copyFailureField(&g_failure_command_buf, command),
+        .hint = copyFailureField(&g_failure_hint_buf, hint),
     };
+}
+
+fn copyFailureField(buf: *[failure_field_max_len]u8, value: []const u8) []const u8 {
+    const n = @min(buf.len, value.len);
+    @memcpy(buf[0..n], value[0..n]);
+    return buf[0..n];
 }
 
 fn printFailureReport(err: anyerror) void {
