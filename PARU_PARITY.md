@@ -9,6 +9,7 @@ This file tracks parity work between `melon` and `paru`.
 - [x] Interactive search selection (install by number)
 - [x] Local package search (`-Qs`)
 - [x] Package info with AUR fallback (`-Si`)
+- [x] AUR info enrichment in `-Si` (votes/popularity/comments/out-of-date + comments URL)
 - [x] Install with official repo first, AUR fallback (`-S`)
 - [x] `-Syu` full system upgrade flow
 - [x] `-Sua` AUR-only upgrade flow
@@ -21,12 +22,18 @@ This file tracks parity work between `melon` and `paru`.
 - [x] Mandatory `.SRCINFO` + dependency review gate
 - [x] PKGBUILD diff against previously reviewed state
 - [x] PKGBUILD security check
+- [x] Source/checksum/signature review summary prompt
+- [x] GPG key and signature verification surfacing during review/build
+- [x] Interactive per-package reject/skip in batch-style runs
 - [x] Recursive AUR dependency resolution
+- [x] Split package support (build-once/install-selected outputs)
 - [x] Devel package detection and update policy (`-git`, `-svn`, etc.)
 - [x] Local clone cache and reuse
 - [x] AUR RPC response caching (memory + disk)
 - [x] Retry/backoff for network operations
 - [x] Parallel prefetch of AUR metadata
+- [x] Parallel AUR clone scheduling for `-G`
+- [x] Resolver memoization for dependency/official checks on large graphs
 - [x] Config file parity flags (all `--[no]` toggle flags)
 - [x] `--version` flag
 - [x] `--color=auto|always|never` and `NO_COLOR` env support
@@ -43,35 +50,36 @@ This file tracks parity work between `melon` and `paru`.
 - [x] Chroot build support
 - [x] Local repo support
 - [x] GPG signing (packages and databases)
+- [x] Build dir retention toggle (`--[no]keepsrc`)
 - [x] Shell completion scripts (bash, zsh, fish)
 - [x] Pacman flag passthrough
 - [x] Zig build script compatibility across Zig versions
 - [x] `--rebuild` flag support
 - [x] AUR Out-of-Date status display in search results
+- [x] Integration tests with mocked pacman/AUR backends (fixture harness + CI)
+- [x] Release automation (tagged builds + published assets + checksums)
 
 ## Remaining Work
 
 ### Core Package Management
 
-- [ ] Split package support
-- [ ] Full pacman flag passthrough compatibility (all edge cases)
-- [ ] Robust exit code behavior matching pacman/paru expectations
+- [x] Full pacman flag passthrough compatibility (improved root-op detection across combined/long flags)
+- [x] Robust passthrough exit code propagation (non-zero pacman codes are preserved)
 
 ### AUR Features
 
-- [ ] Build dir retention policy and cleanup options
-- [ ] AUR comments/rating display
+- [x] AUR comments/rating display
 
 ### Review and Security
 
-- [ ] Source URL and checksum review prompt
-- [ ] GPG key handling and signature verification surfacing
-- [ ] Interactive approve/reject per package in batch transactions
+- [x] Source URL and checksum review prompt
+- [x] GPG key handling and signature verification surfacing
+- [x] Interactive approve/reject per package in batch transactions
 
 ### Performance
 
-- [ ] Parallel downloads/clones/build scheduling
-- [ ] Faster resolver strategy for large dependency graphs
+- [x] Parallel downloads/clones/build scheduling
+- [x] Faster resolver strategy for large dependency graphs
 
 ### UX and Config
 
@@ -80,6 +88,5 @@ This file tracks parity work between `melon` and `paru`.
 
 ### Maintenance
 
-- [ ] Integration tests with mocked pacman/AUR backends
 - [ ] Packaging variants (`melon`, `melon-git`)
-- [ ] Release automation and signed artifacts
+- [ ] Signed release artifacts

@@ -64,6 +64,8 @@ const InstallContext = struct {
     aur_info_cache: std.StringHashMap([]u8),
     aur_pkgbuild_diffs: std.StringHashMap([]u8),
     aur_build_dirs: std.StringHashMap([]u8),
+    official_pkg_cache: std.StringHashMap(bool),
+    dep_satisfied_cache: std.StringHashMap(bool),
     pending_pkg_paths: std.ArrayListUnmanaged([]u8),
     local_repo_dir: ?[]u8,
     skip_remaining_reviews: bool,
@@ -78,6 +80,8 @@ const InstallContext = struct {
             .aur_info_cache = std.StringHashMap([]u8).init(allocator),
             .aur_pkgbuild_diffs = std.StringHashMap([]u8).init(allocator),
             .aur_build_dirs = std.StringHashMap([]u8).init(allocator),
+            .official_pkg_cache = std.StringHashMap(bool).init(allocator),
+            .dep_satisfied_cache = std.StringHashMap(bool).init(allocator),
             .pending_pkg_paths = .{},
             .local_repo_dir = null,
             .skip_remaining_reviews = false,
@@ -88,6 +92,8 @@ const InstallContext = struct {
         freeStringSetKeys(self.allocator, &self.installed_aur);
         freeStringSetKeys(self.allocator, &self.visiting_aur);
         freeStringSetKeys(self.allocator, &self.reviewed_aur);
+        freeStringMapKeys(bool, self.allocator, &self.official_pkg_cache);
+        freeStringMapKeys(bool, self.allocator, &self.dep_satisfied_cache);
         freeStringToOwnedSliceMap(self.allocator, &self.aur_info_cache);
         freeStringToOwnedSliceMap(self.allocator, &self.aur_pkgbuild_diffs);
         var build_it = self.aur_build_dirs.iterator();
@@ -107,6 +113,8 @@ const InstallContext = struct {
         self.aur_info_cache.deinit();
         self.aur_pkgbuild_diffs.deinit();
         self.aur_build_dirs.deinit();
+        self.official_pkg_cache.deinit();
+        self.dep_satisfied_cache.deinit();
     }
 };
 
@@ -188,10 +196,11 @@ pub fn main() !void {
     // -Qs: local search
     if (eql(cmd, "-Qs")) {
         if (parsed.args.len < 2) return usageErr("missing search query");
-        pacmanPassthrough(allocator, parsed.config, parsed.args) catch |err| {
+        const rc = pacmanPassthrough(allocator, parsed.config, parsed.args) catch |err| {
             printFailureReport(err);
             std.process.exit(1);
         };
+        if (rc != 0) std.process.exit(rc);
         return;
     }
 
@@ -208,13 +217,10 @@ pub fn main() !void {
     // -G: clone AUR repo
     if (eql(cmd, "-G")) {
         if (parsed.args.len < 2) return usageErr("missing package name");
-        for (parsed.args[1..]) |pkg| {
-            cloneAurRepo(allocator, pkg) catch |err| {
-                printFailureReport(err);
-                if (parsed.config.failfast) std.process.exit(1);
-                continue;
-            };
-        }
+        cloneAurRepos(allocator, parsed.config, parsed.args[1..]) catch |err| {
+            printFailureReport(err);
+            std.process.exit(1);
+        };
         return;
     }
 
@@ -318,10 +324,11 @@ pub fn main() !void {
 
     // Passthrough anything else that starts with -
     if (parsed.args[0].len > 0 and parsed.args[0][0] == '-') {
-        pacmanPassthrough(allocator, parsed.config, parsed.args) catch |err| {
+        const rc = pacmanPassthrough(allocator, parsed.config, parsed.args) catch |err| {
             printFailureReport(err);
             std.process.exit(1);
         };
+        if (rc != 0) std.process.exit(rc);
         return;
     }
 
@@ -511,6 +518,10 @@ fn installWithCompatibility(allocator: Allocator, config: RunConfig, raw_args: [
     for (aur_targets, 0..) |pkg, idx| {
         progressLine("aur target", pkg, idx + 1, aur_targets.len);
         installAurPackageRecursive(allocator, &ctx, pkg, !config.rebuild, false) catch |err| {
+            if (err == error.PkgbuildSkipped) {
+                warnLineFmt("skipped aur/{s}", .{pkg});
+                continue;
+            }
             recordFailedPackage(allocator, pkg) catch {};
             if (config.failfast) return err;
             g_run_summary.failures += 1;
@@ -525,6 +536,10 @@ fn installWithCompatibility(allocator: Allocator, config: RunConfig, raw_args: [
             progressLine("aur fallback", pkg, idx + 1, official_targets.len);
             warnLineFmt("repo unavailable, trying AUR for: {s}", .{pkg});
             installAurPackageRecursive(allocator, &ctx, pkg, !config.rebuild, false) catch |err| {
+                if (err == error.PkgbuildSkipped) {
+                    warnLineFmt("skipped aur/{s} fallback", .{pkg});
+                    continue;
+                }
                 recordFailedPackage(allocator, pkg) catch {};
                 if (config.failfast) return err;
                 g_run_summary.failures += 1;
@@ -735,6 +750,10 @@ fn searchPackages(allocator: Allocator, config: RunConfig, query: []const u8) !v
     defer ctx.deinit();
     for (to_install.items) |pkg| {
         installAurPackageRecursive(allocator, &ctx, pkg, true, false) catch |err| {
+            if (err == error.PkgbuildSkipped) {
+                warnLineFmt("skipped {s}", .{pkg});
+                continue;
+            }
             warnLineFmt("failed to install {s}: {s}", .{ pkg, @errorName(err) });
             continue;
         };
@@ -760,16 +779,31 @@ fn infoPackage(allocator: Allocator, pkg: []const u8) !void {
         return error.NotFound;
     }
     const entry = info.entry.?;
+    const votes = getInt(entry, "NumVotes") orelse 0;
+    const popularity = getFloat(entry, "Popularity") orelse 0.0;
+    const out_of_date = (getInt(entry, "OutOfDate") orelse 0) != 0;
+    const num_comments = getInt(entry, "NumComments") orelse 0;
+    const comments_url = try std.fmt.allocPrint(
+        allocator,
+        "https://aur.archlinux.org/packages/{s}/?comments=all",
+        .{getString(entry, "Name") orelse pkg},
+    );
+    defer allocator.free(comments_url);
 
     if (g_json_output) {
         std.debug.print(
-            "{{\"command\":\"-Si\",\"repository\":\"aur\",\"name\":\"{s}\",\"version\":\"{s}\",\"description\":\"{s}\",\"url\":\"{s}\",\"maintainer\":\"{s}\"}}\n",
+            "{{\"command\":\"-Si\",\"repository\":\"aur\",\"name\":\"{s}\",\"version\":\"{s}\",\"description\":\"{s}\",\"url\":\"{s}\",\"maintainer\":\"{s}\",\"votes\":{d},\"popularity\":{d:.2},\"num_comments\":{d},\"out_of_date\":{},\"comments_url\":\"{s}\"}}\n",
             .{
                 getString(entry, "Name") orelse "<unknown>",
                 getString(entry, "Version") orelse "<unknown>",
                 getString(entry, "Description") orelse "",
                 getString(entry, "URL") orelse "",
                 getString(entry, "Maintainer") orelse "<orphan>",
+                votes,
+                popularity,
+                num_comments,
+                out_of_date,
+                comments_url,
             },
         );
         return;
@@ -782,6 +816,17 @@ fn infoPackage(allocator: Allocator, pkg: []const u8) !void {
     kv("Description", getString(entry, "Description") orelse "");
     kv("URL", getString(entry, "URL") orelse "");
     kv("Maintainer", getString(entry, "Maintainer") orelse "<orphan>");
+    const votes_text = try std.fmt.allocPrint(allocator, "{d}", .{votes});
+    defer allocator.free(votes_text);
+    const popularity_text = try std.fmt.allocPrint(allocator, "{d:.2}", .{popularity});
+    defer allocator.free(popularity_text);
+    const comments_text = try std.fmt.allocPrint(allocator, "{d}", .{num_comments});
+    defer allocator.free(comments_text);
+    kv("Votes", votes_text);
+    kv("Popularity", popularity_text);
+    kv("Comments", comments_text);
+    kv("OutOfDate", if (out_of_date) "yes" else "no");
+    kv("CommentsURL", comments_url);
     rule();
 }
 
@@ -859,6 +904,10 @@ fn aurUpgrade(allocator: Allocator, config: RunConfig) !void {
             kv("current", installed);
             kv("latest", latest);
             installAurPackageRecursive(allocator, &ctx, base, false, false) catch |err| {
+                if (err == error.PkgbuildSkipped) {
+                    warnLineFmt("skipped aur/{s}", .{base});
+                    continue;
+                }
                 recordFailedPackage(allocator, base) catch {};
                 if (config.failfast) return err;
                 g_run_summary.failures += 1;
@@ -974,6 +1023,61 @@ fn cloneAurRepo(allocator: Allocator, pkg: []const u8) !void {
         return error.AurCloneFailed;
     }
     okLineFmt("cloned {s}", .{pkg});
+}
+
+const CloneState = struct {
+    next_idx: std.atomic.Value(usize),
+    names: []const []const u8,
+    failed: std.atomic.Value(usize),
+};
+
+fn cloneAurRepos(allocator: Allocator, config: RunConfig, pkgs: []const []const u8) !void {
+    if (pkgs.len == 0) return;
+    if (pkgs.len == 1 or config.failfast) {
+        for (pkgs) |pkg| try cloneAurRepo(allocator, pkg);
+        return;
+    }
+
+    sectionFmt("cloning {d} AUR repos in parallel", .{pkgs.len});
+    var state = CloneState{
+        .next_idx = std.atomic.Value(usize).init(0),
+        .names = pkgs,
+        .failed = std.atomic.Value(usize).init(0),
+    };
+
+    const cpu_count = std.Thread.getCpuCount() catch default_prefetch_jobs;
+    const worker_count = @min(@min(cpu_count, default_prefetch_jobs), pkgs.len);
+    const threads = try allocator.alloc(std.Thread, worker_count);
+    defer allocator.free(threads);
+
+    for (threads, 0..) |*th, idx| {
+        th.* = try std.Thread.spawn(.{}, cloneAurRepoWorker, .{ &state, idx });
+    }
+    for (threads) |th| th.join();
+
+    const failed = state.failed.load(.monotonic);
+    if (failed > 0) {
+        setFailureContext("clone", "aur", "git clone", "One or more clone operations failed; rerun with --failfast for first-error behavior");
+        return error.AurCloneFailed;
+    }
+}
+
+fn cloneAurRepoWorker(state: *CloneState, _: usize) void {
+    const allocator = std.heap.page_allocator;
+    while (true) {
+        const idx = state.next_idx.fetchAdd(1, .monotonic);
+        if (idx >= state.names.len) break;
+        const pkg = state.names[idx];
+        const repo_url = std.fmt.allocPrint(allocator, "https://aur.archlinux.org/{s}.git", .{pkg}) catch {
+            _ = state.failed.fetchAdd(1, .monotonic);
+            continue;
+        };
+        defer allocator.free(repo_url);
+        const rc = runStreamingRetry(allocator, &.{ "git", "clone", repo_url }, network_retry_max_attempts, network_retry_initial_delay_ms) catch 1;
+        if (rc != 0) {
+            _ = state.failed.fetchAdd(1, .monotonic);
+        }
+    }
 }
 
 fn cleanCacheLight(allocator: Allocator, config: RunConfig) !void {
@@ -1132,6 +1236,7 @@ fn installAurPackageRecursive(allocator: Allocator, ctx: *InstallContext, pkg: [
                 return error.NotFound;
             }
             try installBuiltPackages(allocator, ctx.config, requested_pkg_paths);
+            clearDependencySatisfiedCache(ctx);
             aurStepLine(repo_base, if (is_dependency) "dependency" else "target", "installed package");
             return;
         }
@@ -1193,6 +1298,7 @@ fn installAurPackageRecursive(allocator: Allocator, ctx: *InstallContext, pkg: [
     if (ctx.config.pgpfetch) {
         const verify_rc = try runStreamingCwd(allocator, build_dir, &.{ "makepkg", "--verifysource" });
         if (verify_rc != 0) {
+            printSignatureVerificationHints(srcinfo);
             setFailureContext("aur verify", repo_base, "makepkg --verifysource", "Import required keys and retry, or disable with --nopgpfetch");
             return error.MakepkgFailed;
         }
@@ -1230,6 +1336,7 @@ fn installAurPackageRecursive(allocator: Allocator, ctx: *InstallContext, pkg: [
         aurStepLine(repo_base, if (is_dependency) "dependency" else "target", "queued for batch install");
     } else {
         try installBuiltPackages(allocator, ctx.config, requested_pkg_paths);
+        clearDependencySatisfiedCache(ctx);
         aurStepLine(repo_base, if (is_dependency) "dependency" else "target", "installed package");
     }
 
@@ -1277,18 +1384,19 @@ fn resolveAurDependencies(allocator: Allocator, ctx: *InstallContext, srcinfo: [
     defer repo_deps.deinit(allocator);
 
     for (deps.items) |dep| {
-        if (try isDependencySatisfied(allocator, dep)) continue;
-        if (try isOfficialPackage(allocator, dep)) {
+        if (try isDependencySatisfiedCached(allocator, ctx, dep)) continue;
+        if (try isOfficialPackageCached(allocator, ctx, dep)) {
             try repo_deps.append(allocator, dep);
         }
     }
 
     if (repo_deps.items.len > 0) {
         try installOfficialDependenciesBatch(allocator, ctx, repo_deps.items);
+        clearDependencySatisfiedCache(ctx);
     }
 
     for (deps.items) |dep| {
-        if (try isDependencySatisfied(allocator, dep)) continue;
+        if (try isDependencySatisfiedCached(allocator, ctx, dep)) continue;
         try ensureDependencyInstalled(allocator, ctx, dep);
     }
 }
@@ -1336,13 +1444,14 @@ fn installOfficialDependenciesBatch(allocator: Allocator, ctx: *InstallContext, 
 
 fn ensureDependencyInstalled(allocator: Allocator, ctx: *InstallContext, dep: []const u8) anyerror!void {
     if (dep.len == 0) return;
-    if (try isDependencySatisfied(allocator, dep)) return;
+    if (try isDependencySatisfiedCached(allocator, ctx, dep)) return;
 
-    if (try isOfficialPackage(allocator, dep)) {
+    if (try isOfficialPackageCached(allocator, ctx, dep)) {
         sectionFmt("install dependency from repos: {s}", .{dep});
         const rc = try runPacmanSudoMaybe(allocator, ctx.config, &.{ "-S", "--needed", dep });
         if (rc == 0) {
             if (ctx.config.installdebug) try installDebugCompanions(allocator, ctx.config, &.{dep});
+            clearDependencySatisfiedCache(ctx);
             return;
         }
         warnLineFmt("repo dependency install failed for {s}; trying AUR fallback", .{dep});
@@ -1384,13 +1493,15 @@ fn reviewAurPackage(allocator: Allocator, ctx: *InstallContext, build_dir: []con
     std.debug.print("  3) View full .SRCINFO\n", .{});
     std.debug.print("  4) View source diff (PKGBUILD/.install/.patch/etc)\n", .{});
     std.debug.print("  5) Run PKGBUILD security check\n", .{});
+    std.debug.print("  6) View source/checksum/signature summary\n", .{});
     std.debug.print("  c) Continue build\n", .{});
     std.debug.print("  a) Continue and trust all for this run\n", .{});
+    std.debug.print("  s) Skip this package (continue run)\n", .{});
     std.debug.print("  q) Abort\n", .{});
 
     var did_security_check = false;
     while (true) {
-        const choice = try promptLine(allocator, "Choose [1/2/3/4/5/c/a/q]: ");
+        const choice = try promptLine(allocator, "Choose [1/2/3/4/5/6/c/a/s/q]: ");
         defer allocator.free(choice);
         if (eql(choice, "1")) {
             try showFileForReview(allocator, build_dir, "PKGBUILD");
@@ -1426,6 +1537,10 @@ fn reviewAurPackage(allocator: Allocator, ctx: *InstallContext, build_dir: []con
             did_security_check = true;
             continue;
         }
+        if (eql(choice, "6")) {
+            try printSourceIntegrityLines(allocator, build_dir, srcinfo);
+            continue;
+        }
         if (eql(choice, "c")) {
             if (!did_security_check) {
                 warnLine("run option 5 (security check) before continuing");
@@ -1451,6 +1566,10 @@ fn reviewAurPackage(allocator: Allocator, ctx: *InstallContext, build_dir: []con
         }
         if (eql(choice, "q")) {
             return error.PkgbuildRejected;
+        }
+        if (eql(choice, "s")) {
+            warnLineFmt("skipping aur/{s} by user request", .{repo_base});
+            return error.PkgbuildSkipped;
         }
         warnLine("invalid choice");
     }
@@ -1484,6 +1603,9 @@ fn runPkgbuildSecurityCheck(allocator: Allocator, build_dir: []const u8) !void {
     std.debug.print("  - Network/download indicators: {s}\n", .{if (analysis.network) "present" else "not obvious"});
     std.debug.print("  - File mutation indicators: {s}\n", .{if (analysis.file_mutation) "present" else "not obvious"});
     std.debug.print("  - Service/system mutation indicators: {s}\n", .{if (analysis.system_mutation) "present" else "not obvious"});
+    std.debug.print("  - Checksum arrays declared: {s}\n", .{if (analysis.checksum_arrays) "yes" else "no"});
+    std.debug.print("  - Signature source files (.sig) referenced: {s}\n", .{if (analysis.signature_sources) "yes" else "not obvious"});
+    std.debug.print("  - validpgpkeys declared: {s}\n", .{if (analysis.valid_pgp_keys) "yes" else "no"});
     if (analysis.unsafe_flag_count > 0) {
         std.debug.print("  - Unsafe makepkg option flags ({d}): ", .{analysis.unsafe_flag_count});
         for (analysis.unsafe_flags, 0..) |flag, idx| {
@@ -1513,6 +1635,9 @@ const PkgbuildAnalysis = struct {
     network: bool = false,
     file_mutation: bool = false,
     system_mutation: bool = false,
+    checksum_arrays: bool = false,
+    signature_sources: bool = false,
+    valid_pgp_keys: bool = false,
     unsafe_flags: [16][]const u8 = [_][]const u8{""} ** 16,
     unsafe_flag_count: usize = 0,
     risky_markers: [16][]const u8 = [_][]const u8{""} ** 16,
@@ -1521,6 +1646,13 @@ const PkgbuildAnalysis = struct {
 
 fn analyzePkgbuildCapabilities(body: []const u8) PkgbuildAnalysis {
     var out = PkgbuildAnalysis{};
+    out.checksum_arrays = std.mem.indexOf(u8, body, "sha256sums=(") != null or
+        std.mem.indexOf(u8, body, "sha512sums=(") != null or
+        std.mem.indexOf(u8, body, "b2sums=(") != null or
+        std.mem.indexOf(u8, body, "md5sums=(") != null;
+    out.valid_pgp_keys = std.mem.indexOf(u8, body, "validpgpkeys=(") != null;
+    out.signature_sources = std.mem.indexOf(u8, body, ".sig") != null;
+
     const unsafe_flag_candidates = [_][]const u8{
         "!strip",
         "!check",
@@ -1597,6 +1729,65 @@ fn printDependencyLines(srcinfo: []const u8) !void {
     }
     if (!found) std.debug.print("  - (none declared)\n", .{});
     rule();
+}
+
+fn printSourceIntegrityLines(allocator: Allocator, build_dir: []const u8, srcinfo: []const u8) !void {
+    const pkgbuild_path = try std.fmt.allocPrint(allocator, "{s}/PKGBUILD", .{build_dir});
+    defer allocator.free(pkgbuild_path);
+    const maybe_body = readFileAbsoluteAlloc(allocator, pkgbuild_path, 1024 * 1024) catch null;
+    defer if (maybe_body) |body| allocator.free(body);
+
+    std.debug.print("\n{s}source/checksum/signature summary{s}\n", .{ color_title, color_reset });
+    rule();
+    var found = false;
+    var it = std.mem.splitScalar(u8, srcinfo, '\n');
+    while (it.next()) |line| {
+        const trimmed = std.mem.trim(u8, line, " \t\r");
+        if (!startsWithAny(trimmed, &.{
+            "source = ",
+            "sha256sums = ",
+            "sha512sums = ",
+            "b2sums = ",
+            "md5sums = ",
+            "validpgpkeys = ",
+        })) continue;
+        found = true;
+        std.debug.print("  - {s}\n", .{trimmed});
+    }
+
+    if (found) {
+        if (std.mem.indexOf(u8, srcinfo, ".sig") != null) {
+            std.debug.print("  - signature source files: present\n", .{});
+        } else {
+            std.debug.print("  - signature source files: not obvious\n", .{});
+        }
+    } else if (maybe_body != null) {
+        std.debug.print("  - summary not derivable from .SRCINFO; inspect PKGBUILD directly\n", .{});
+    } else {
+        std.debug.print("  - unable to load PKGBUILD summary\n", .{});
+    }
+    rule();
+}
+
+fn printSignatureVerificationHints(srcinfo: []const u8) void {
+    var has_keys = false;
+    var has_sig_sources = false;
+    var it = std.mem.splitScalar(u8, srcinfo, '\n');
+    while (it.next()) |line| {
+        const trimmed = std.mem.trim(u8, line, " \t\r");
+        if (std.mem.startsWith(u8, trimmed, "validpgpkeys = ")) {
+            if (!has_keys) {
+                warnLine("signature verification failed; PKGBUILD declares these keys:");
+                has_keys = true;
+            }
+            std.debug.print("  - {s}\n", .{std.mem.trim(u8, trimmed["validpgpkeys = ".len..], " \t")});
+        }
+        if (std.mem.startsWith(u8, trimmed, "source = ") and std.mem.indexOf(u8, trimmed, ".sig") != null) {
+            has_sig_sources = true;
+        }
+    }
+    if (!has_keys) warnLine("signature verification failed; no validpgpkeys entry found in .SRCINFO");
+    warnLineFmt("signature source files present: {s}", .{if (has_sig_sources) "yes" else "not obvious"});
 }
 
 const AurInfo = struct {
@@ -2346,6 +2537,7 @@ fn flushPendingBatchInstalls(allocator: Allocator, ctx: *InstallContext) !void {
     if (!ctx.config.batchinstall or ctx.pending_pkg_paths.items.len == 0) return;
     section("batch install");
     try installBuiltPackages(allocator, ctx.config, ctx.pending_pkg_paths.items);
+    clearDependencySatisfiedCache(ctx);
     for (ctx.pending_pkg_paths.items) |path| allocator.free(path);
     ctx.pending_pkg_paths.clearRetainingCapacity();
 }
@@ -2409,12 +2601,31 @@ fn isOfficialPackage(allocator: Allocator, pkg: []const u8) !bool {
     return rc_prov == 0;
 }
 
-fn pacmanPassthrough(allocator: Allocator, config: RunConfig, pacman_args: []const []const u8) !void {
+fn isOfficialPackageCached(allocator: Allocator, ctx: *InstallContext, pkg: []const u8) !bool {
+    if (ctx.official_pkg_cache.get(pkg)) |cached| return cached;
+    const value = try isOfficialPackage(allocator, pkg);
+    try ctx.official_pkg_cache.put(try allocator.dupe(u8, pkg), value);
+    return value;
+}
+
+fn isDependencySatisfiedCached(allocator: Allocator, ctx: *InstallContext, dep: []const u8) !bool {
+    if (ctx.dep_satisfied_cache.get(dep)) |cached| return cached;
+    const value = try isDependencySatisfied(allocator, dep);
+    try ctx.dep_satisfied_cache.put(try allocator.dupe(u8, dep), value);
+    return value;
+}
+
+fn clearDependencySatisfiedCache(ctx: *InstallContext) void {
+    freeStringMapKeys(bool, ctx.allocator, &ctx.dep_satisfied_cache);
+    ctx.dep_satisfied_cache.clearRetainingCapacity();
+}
+
+fn pacmanPassthrough(allocator: Allocator, config: RunConfig, pacman_args: []const []const u8) !u8 {
     const rc = if (needsRootPacman(pacman_args))
         try runPacmanSudoMaybe(allocator, config, pacman_args)
     else
         try runPacman(allocator, pacman_args);
-    if (rc != 0) return error.PacmanPassthroughFailed;
+    return rc;
 }
 
 fn isDependencySatisfied(allocator: Allocator, dep: []const u8) !bool {
@@ -2425,19 +2636,22 @@ fn isDependencySatisfied(allocator: Allocator, dep: []const u8) !bool {
 
 fn needsRootPacman(args: []const []const u8) bool {
     if (args.len == 0) return false;
-    const first = args[0];
-    if (std.mem.startsWith(u8, first, "--sync") or
-        std.mem.startsWith(u8, first, "--remove") or
-        std.mem.startsWith(u8, first, "--upgrade") or
-        std.mem.startsWith(u8, first, "--database"))
-    {
-        return true;
-    }
-    if (first.len < 2 or first[0] != '-') return false;
-    var i: usize = 1;
-    while (i < first.len) : (i += 1) {
-        const c = first[i];
-        if (c == 'S' or c == 'R' or c == 'U' or c == 'D') return true;
+    for (args) |arg| {
+        if (eql(arg, "--")) break;
+        if (arg.len == 0 or arg[0] != '-') continue;
+        if (std.mem.startsWith(u8, arg, "--sync") or
+            std.mem.startsWith(u8, arg, "--remove") or
+            std.mem.startsWith(u8, arg, "--upgrade") or
+            std.mem.startsWith(u8, arg, "--database"))
+        {
+            return true;
+        }
+        if (arg.len < 2 or arg[1] == '-') continue;
+        var i: usize = 1;
+        while (i < arg.len) : (i += 1) {
+            const c = arg[i];
+            if (c == 'S' or c == 'R' or c == 'U' or c == 'D') return true;
+        }
     }
     return false;
 }
@@ -2536,7 +2750,11 @@ fn runCaptureRetry(allocator: Allocator, argv: []const []const u8, max_attempts:
 }
 
 fn freeStringSetKeys(allocator: Allocator, set: *std.StringHashMap(void)) void {
-    var it = set.keyIterator();
+    freeStringMapKeys(void, allocator, set);
+}
+
+fn freeStringMapKeys(comptime V: type, allocator: Allocator, map: *std.StringHashMap(V)) void {
+    var it = map.keyIterator();
     while (it.next()) |key| {
         allocator.free(key.*);
     }
@@ -2794,4 +3012,23 @@ test "selectBuiltPackageFilesForTargets keeps only requested split outputs" {
 
     try std.testing.expectEqual(@as(usize, 1), selected.len);
     try std.testing.expectEqualStrings(pkg_paths[1], selected[0]);
+}
+
+test "needsRootPacman detects long and combined operation flags" {
+    try std.testing.expect(needsRootPacman(&.{ "--sync", "ripgrep" }));
+    try std.testing.expect(needsRootPacman(&.{"-Syu"}));
+    try std.testing.expect(needsRootPacman(&.{ "-Q", "-S" }));
+    try std.testing.expect(!needsRootPacman(&.{ "-Qi", "zig" }));
+}
+
+test "analyzePkgbuildCapabilities surfaces signature metadata markers" {
+    const body =
+        \\source=('demo.tar.gz' 'demo.tar.gz.sig')
+        \\sha256sums=('abc')
+        \\validpgpkeys=('ABCDEF0123456789')
+    ;
+    const analysis = analyzePkgbuildCapabilities(body);
+    try std.testing.expect(analysis.checksum_arrays);
+    try std.testing.expect(analysis.signature_sources);
+    try std.testing.expect(analysis.valid_pgp_keys);
 }

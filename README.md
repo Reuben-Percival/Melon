@@ -44,8 +44,10 @@ Before each AUR build (unless explicitly bypassed), Melon requires an interactiv
 - `3`: view full `.SRCINFO`.
 - `4`: view source diff since last reviewed commit (`PKGBUILD`, `.install`, patches, and other tracked build files).
 - `5`: run PKGBUILD security check (capabilities, risky markers, unsafe makepkg flags such as `!strip`, `!check`, `!fortify`).
+- `6`: view source/checksum/signature summary (`source`, checksum arrays, `validpgpkeys`).
 - `c`: continue build.
 - `a`: continue and trust remaining packages for the current run.
+- `s`: skip this package and continue the run.
 - `q`: abort.
 
 `5` (security check) is required before `c`/`a` for that prompt.
