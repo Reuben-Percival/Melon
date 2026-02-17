@@ -189,10 +189,18 @@ zig build run -- -Cbd
 - `src/process.zig`: process execution helpers.
 - `src/ui.zig`: terminal UI helpers.
 - `src/reporting.zig`: run summaries and failure context.
+- `src/json_helpers.zig`: shared JSON field extraction helpers.
 
 ## CI and Releases
 
-- CI validates formatting, build/test, install smoke paths, and Arch container builds.
+- CI validates:
+  - workflow syntax (`actionlint`)
+  - Zig formatting (`zig fmt --check`)
+  - shell scripts (`bash -n` + `shellcheck`)
+  - build/test across Zig `0.14.1` and `0.15.2`
+  - install/uninstall smoke paths
+  - integration logic harness
+  - Arch Linux container build/test
 - Tagged releases (`v*`) publish Linux `x86_64` binary artifacts and SHA-256 checksums.
 
 ## Validated Scenarios
