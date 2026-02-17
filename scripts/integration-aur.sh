@@ -224,7 +224,8 @@ if [[ "$*" == *"--verifysource"* ]]; then
   exit 0
 fi
 
-if [[ "$*" == *"--noinstall"* ]]; then
+# Normal package build path (supports both legacy --noinstall and default build invocation).
+if [[ "$*" == *"-s"* || "$*" == *"--syncdeps"* || "$*" == *"--noconfirm"* || "$*" == *"--noinstall"* ]]; then
   echo "MAKEPKG_BUILD $(basename "$PWD")" >> "$LOG_DIR/makepkg.log"
   mapfile -t pkgs < <(awk -F'=' '/^pkgname = /{gsub(/^ +| +$/, "", $2); print $2}' .SRCINFO | sort -u)
   [[ "${#pkgs[@]}" -gt 0 ]] || { echo "no pkgname entries" >&2; exit 1; }
