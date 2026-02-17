@@ -77,9 +77,6 @@ pub fn promptLine(allocator: Allocator, prompt: []const u8) ![]u8 {
 fn readStdinLine(buf: []u8) !?[]u8 {
     if (@hasDecl(std.fs.File, "stdin")) {
         const stdin_file = std.fs.File.stdin();
-        if (@hasDecl(@TypeOf(stdin_file), "reader")) {
-            return stdin_file.reader().readUntilDelimiterOrEof(buf, '\n');
-        }
         if (@hasDecl(@TypeOf(stdin_file), "deprecatedReader")) {
             return stdin_file.deprecatedReader().readUntilDelimiterOrEof(buf, '\n');
         }
@@ -87,9 +84,6 @@ fn readStdinLine(buf: []u8) !?[]u8 {
     if (@hasDecl(std, "io")) {
         if (@hasDecl(std.io, "getStdIn")) {
             const stdin_file = std.io.getStdIn();
-            if (@hasDecl(@TypeOf(stdin_file), "reader")) {
-                return stdin_file.reader().readUntilDelimiterOrEof(buf, '\n');
-            }
             if (@hasDecl(@TypeOf(stdin_file), "deprecatedReader")) {
                 return stdin_file.deprecatedReader().readUntilDelimiterOrEof(buf, '\n');
             }
@@ -98,9 +92,6 @@ fn readStdinLine(buf: []u8) !?[]u8 {
     if (@hasDecl(std, "Io")) {
         if (@hasDecl(std.Io, "getStdIn")) {
             const stdin_file = std.Io.getStdIn();
-            if (@hasDecl(@TypeOf(stdin_file), "reader")) {
-                return stdin_file.reader().readUntilDelimiterOrEof(buf, '\n');
-            }
             if (@hasDecl(@TypeOf(stdin_file), "deprecatedReader")) {
                 return stdin_file.deprecatedReader().readUntilDelimiterOrEof(buf, '\n');
             }
