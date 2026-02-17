@@ -84,7 +84,7 @@ This file tracks parity work between `melon` and `paru`.
 ### UX and Config
 
 - [ ] Config file (`~/.config/melon/melon.conf`)
-- [ ] Interactive menu mode and package selection (fuzzy)
+- [x] Interactive menu mode and package selection (fuzzy)
 
 ### Maintenance
 

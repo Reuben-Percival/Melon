@@ -22,10 +22,12 @@
 
 - Unified search and inspection:
   - `melon -Ss <query>` searches official repositories and AUR in one flow.
+  - `-Ss` supports interactive AUR install selection: number picks (`1 3 5`) or fuzzy multi-select via `fzf` (`f`).
   - `melon -Si <package>` resolves package metadata with repo-first, AUR fallback behavior.
 - Mixed-target installs:
   - `melon -S [options] <targets...>` splits repo and AUR targets automatically.
   - Supports shared install options such as `--needed` and `--noconfirm`.
+  - Prints a post-install summary with requested/installed/skipped/failed counts and retry hint.
 - Upgrade workflows:
   - `melon -Syu` performs full system upgrade plus AUR upgrade pass.
   - `melon -Sua` upgrades only installed AUR/foreign packages.

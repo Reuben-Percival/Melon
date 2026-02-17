@@ -13,8 +13,10 @@ Primary reference remains `README.md`. This wiki provides operational notes and 
 ## Core Flows
 
 - `-S`: mixed-target install (repo-first + AUR fallback).
+- `-S` post-run summary reports requested/installed/skipped/failed counts with retry hint.
 - `-Syu`: full system upgrade plus AUR upgrade pass.
 - `-Sua`: AUR/foreign-only upgrade.
+- `-Ss`: supports interactive AUR install picks by number, plus fuzzy multi-select when `fzf` is available.
 - `-Qu`/`-Qua`: update check without install.
 - `-G`: clone AUR repos (parallelized when cloning multiple targets).
 - pacman passthrough: non-overridden pacman flags are forwarded with root-op detection and exit-code propagation.
