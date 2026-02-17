@@ -1373,11 +1373,11 @@ fn reviewAurPackage(allocator: Allocator, ctx: *InstallContext, build_dir: []con
     kv("path", build_dir);
     if (reviewed_from) |commit| kv("reviewed from", commit);
     std.debug.print("\n", .{});
-    std.debug.print("  1) View PKGBUILD\n", .{});
+    std.debug.print("  1) View PKGBUILD (syntax highlighted)\n", .{});
     std.debug.print("  2) View dependency summary\n", .{});
     std.debug.print("  3) View full .SRCINFO\n", .{});
     std.debug.print("  4) View source diff (PKGBUILD/.install/.patch/etc)\n", .{});
-    std.debug.print("  5) Run PKGBUILD security check\n", .{});
+    std.debug.print("  5) Run PKGBUILD security check + source/checksum summary\n", .{});
     std.debug.print("  c) Continue build\n", .{});
     std.debug.print("  a) Continue and trust all for this run\n", .{});
     std.debug.print("  q) Abort\n", .{});
@@ -1500,6 +1500,7 @@ fn runPkgbuildSecurityCheck(allocator: Allocator, build_dir: []const u8) !void {
     } else {
         std.debug.print("  - Risky command markers: none detected\n", .{});
     }
+    try printSourceReviewSummary(allocator, build_dir);
     rule();
 }
 
@@ -1566,10 +1567,123 @@ fn readFileAbsoluteAlloc(allocator: Allocator, path: []const u8, max: usize) ![]
 }
 
 fn showFileForReview(allocator: Allocator, build_dir: []const u8, file_name: []const u8) !void {
+    if (eql(file_name, "PKGBUILD")) {
+        const pkgbuild_path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ build_dir, file_name });
+        defer allocator.free(pkgbuild_path);
+        const body = try readFileAbsoluteAlloc(allocator, pkgbuild_path, 1024 * 1024);
+        defer allocator.free(body);
+        return printPkgbuildHighlighted(body);
+    }
     const pager_rc = runStreamingCwd(allocator, build_dir, &.{ "less", "-R", file_name }) catch 1;
     if (pager_rc == 0) return;
     const cat_rc = runStreamingCwd(allocator, build_dir, &.{ "cat", file_name }) catch 1;
     if (cat_rc != 0) return error.PkgbuildReadFailed;
+}
+
+fn printPkgbuildHighlighted(body: []const u8) !void {
+    std.debug.print("\n{s}PKGBUILD{s}\n", .{ color_title, color_reset });
+    rule();
+    var lines = std.mem.splitScalar(u8, body, '\n');
+    while (lines.next()) |line| {
+        try printPkgbuildLineHighlighted(line);
+        std.debug.print("\n", .{});
+    }
+    rule();
+}
+
+fn printPkgbuildLineHighlighted(line: []const u8) !void {
+    const trimmed = std.mem.trimLeft(u8, line, " \t");
+    if (trimmed.len == 0) return;
+    if (trimmed[0] == '#') {
+        std.debug.print("{s}{s}{s}", .{ color_dim, line, color_reset });
+        return;
+    }
+
+    const eq_idx = std.mem.indexOfScalar(u8, trimmed, '=');
+    if (eq_idx) |idx| {
+        const lhs = std.mem.trim(u8, trimmed[0..idx], " \t");
+        if (lhs.len > 0 and isSimpleIdentifier(lhs)) {
+            const lead_ws_len = line.len - trimmed.len;
+            std.debug.print("{s}{s}{s}{s}{s}", .{
+                line[0..lead_ws_len], color_title, lhs, color_reset, trimmed[idx..],
+            });
+            return;
+        }
+    }
+
+    if (std.mem.indexOf(u8, trimmed, "()") != null and std.mem.indexOfScalar(u8, trimmed, '{') != null) {
+        std.debug.print("{s}{s}{s}", .{ color_title, line, color_reset });
+        return;
+    }
+    std.debug.print("{s}", .{line});
+}
+
+fn isSimpleIdentifier(s: []const u8) bool {
+    if (s.len == 0) return false;
+    for (s, 0..) |ch, i| {
+        if (i == 0) {
+            if (!std.ascii.isAlphabetic(ch) and ch != '_') return false;
+            continue;
+        }
+        if (!std.ascii.isAlphanumeric(ch) and ch != '_') return false;
+    }
+    return true;
+}
+
+fn printSourceReviewSummary(allocator: Allocator, build_dir: []const u8) !void {
+    const srcinfo_path = try std.fmt.allocPrint(allocator, "{s}/.SRCINFO", .{build_dir});
+    defer allocator.free(srcinfo_path);
+    const srcinfo = readFileAbsoluteAlloc(allocator, srcinfo_path, 1024 * 1024) catch {
+        std.debug.print("  - Source entries: unavailable (.SRCINFO missing)\n", .{});
+        return;
+    };
+    defer allocator.free(srcinfo);
+
+    var source_count: usize = 0;
+    var checksum_count: usize = 0;
+    var checksum_skip_count: usize = 0;
+    var line_it = std.mem.splitScalar(u8, srcinfo, '\n');
+    while (line_it.next()) |line| {
+        const trimmed = std.mem.trim(u8, line, " \t\r");
+        if (trimmed.len == 0) continue;
+        if (std.mem.startsWith(u8, trimmed, "source = ")) {
+            source_count += 1;
+            continue;
+        }
+        const checksum_prefixes = [_][]const u8{
+            "md5sums = ",  "sha1sums = ", "sha224sums = ", "sha256sums = ",
+            "sha384sums = ", "sha512sums = ", "b2sums = ", "cksums = ",
+        };
+        for (checksum_prefixes) |prefix| {
+            if (!std.mem.startsWith(u8, trimmed, prefix)) continue;
+            checksum_count += 1;
+            const value = std.mem.trim(u8, trimmed[prefix.len..], " \t\r");
+            if (std.ascii.eqlIgnoreCase(value, "SKIP")) checksum_skip_count += 1;
+            break;
+        }
+    }
+
+    std.debug.print("  - Source entries: {d}\n", .{source_count});
+    std.debug.print("  - Checksum entries: {d}", .{checksum_count});
+    if (checksum_skip_count > 0) {
+        std.debug.print(" ({d} set to SKIP)\n", .{checksum_skip_count});
+    } else {
+        std.debug.print(" (no SKIP)\n", .{});
+    }
+
+    if (source_count == 0) {
+        std.debug.print("  - Source URLs/paths: none declared in .SRCINFO\n", .{});
+        return;
+    }
+
+    std.debug.print("  - Source URLs/paths:\n", .{});
+    line_it = std.mem.splitScalar(u8, srcinfo, '\n');
+    while (line_it.next()) |line| {
+        const trimmed = std.mem.trim(u8, line, " \t\r");
+        if (!std.mem.startsWith(u8, trimmed, "source = ")) continue;
+        const value = std.mem.trim(u8, trimmed["source = ".len..], " \t\r");
+        std.debug.print("    * {s}\n", .{value});
+    }
 }
 
 fn printDependencyLines(srcinfo: []const u8) !void {

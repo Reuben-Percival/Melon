@@ -64,7 +64,7 @@ This file tracks parity work between `melon` and `paru`.
 
 ### Review and Security
 
-- [ ] Source URL and checksum review prompt
+- [x] Source URL and checksum review prompt
 - [ ] GPG key handling and signature verification surfacing
 - [ ] Interactive approve/reject per package in batch transactions
 
