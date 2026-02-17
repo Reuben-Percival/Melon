@@ -1789,8 +1789,8 @@ fn printSourceReviewSummary(allocator: Allocator, build_dir: []const u8) !void {
             continue;
         }
         const checksum_prefixes = [_][]const u8{
-            "md5sums = ",  "sha1sums = ", "sha224sums = ", "sha256sums = ",
-            "sha384sums = ", "sha512sums = ", "b2sums = ", "cksums = ",
+            "md5sums = ",    "sha1sums = ",   "sha224sums = ", "sha256sums = ",
+            "sha384sums = ", "sha512sums = ", "b2sums = ",     "cksums = ",
         };
         for (checksum_prefixes) |prefix| {
             if (!std.mem.startsWith(u8, trimmed, prefix)) continue;
