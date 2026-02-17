@@ -1,92 +1,146 @@
 # Melon
 
-`melon` is a Zig-based AUR helper for Arch Linux focused on explicit review, resilient upgrades, and clear terminal UX.
+`melon` is a Zig-based AUR helper for Arch Linux focused on explicit PKGBUILD review, resilient upgrades, and predictable terminal output.
 
-## Project status
+## Status
 
-- Active development.
-- Current packaging model: rolling git source (`PKGBUILD` builds from `https://github.com/Reuben-Percival/Melon.git`).
-- `pkgver` is derived from git revision count + commit hash (`r<rev>.<hash>`).
+- Development status: active.
+- Packaging model: rolling git source (`PKGBUILD` builds from `https://github.com/Reuben-Percival/Melon.git`).
+- `pkgver` format: `r<rev>.<hash>` (git revision count + short commit hash).
 
-## Core commands
+## Why Melon
 
-- `melon -Ss <query>`: search official repos and AUR.
-- `melon -Si <package>`: package info (repo first, AUR fallback).
-- `melon -S [options] <targets...>`: install targets (repo first, AUR fallback).
-- `melon -Syu`: full system upgrade + AUR upgrades (best-effort AUR continuation if repo sync fails).
-- `melon -Sua`: upgrade only installed AUR/foreign packages.
-- `melon -Cbd`: prune all unused dependency packages (`pacman -Qtdq` + `pacman -Rns`, repeated until clean).
-- `melon -Qm`: list foreign packages.
-- `melon <pacman flags...>`: passthrough for non-overridden pacman operations.
+- Review-first AUR workflow with required security check before build continuation.
+- Repo-first behavior with AUR fallback when appropriate.
+- Split-package-aware dependency solving (`pkgname`/`provides` from `.SRCINFO`).
+- Structured failure context and resumable failed package sets.
+- Shell completions for bash, zsh, and fish.
 
-## Runtime options
+## Feature Highlights
 
-- `-h`, `--help`: show command and flag help.
+### Package operations
+
+- Unified search and inspection:
+  - `melon -Ss <query>` searches official repositories and AUR in one flow.
+  - `melon -Si <package>` resolves package metadata with repo-first, AUR fallback behavior.
+- Mixed-target installs:
+  - `melon -S [options] <targets...>` splits repo and AUR targets automatically.
+  - Supports shared install options such as `--needed` and `--noconfirm`.
+- Upgrade workflows:
+  - `melon -Syu` performs full system upgrade plus AUR upgrade pass.
+  - `melon -Sua` upgrades only installed AUR/foreign packages.
+- Maintenance and utility operations:
+  - `melon -Qm` lists foreign packages.
+  - `melon -Cbd` prunes unused dependency packages until no orphans remain.
+  - `melon -G <pkg...>` clones AUR repositories for offline/manual inspection.
+  - `melon <pacman flags...>` passes through non-overridden pacman operations.
+
+### Review and safety
+
+Before each AUR build (unless explicitly bypassed), Melon requires an interactive review step:
+
+- `1`: view raw `PKGBUILD`.
+- `2`: view dependency summary.
+- `3`: view full `.SRCINFO`.
+- `4`: view source diff since last reviewed commit (`PKGBUILD`, `.install`, patches, and other tracked build files).
+- `5`: run PKGBUILD security check (capabilities, risky markers, unsafe makepkg flags such as `!strip`, `!check`, `!fortify`).
+- `c`: continue build.
+- `a`: continue and trust remaining packages for the current run.
+- `q`: abort.
+
+`5` (security check) is required before `c`/`a` for that prompt.
+
+### Resilience behavior
+
+- Dependency solver:
+  - Recursively resolves `depends`, `makedepends`, and `checkdepends`.
+  - Uses split-package-aware solving via `.SRCINFO` `pkgname`/`provides`.
+  - Avoids false dependency cycles inside a single `pkgbase`.
+  - Supports split package workflows:
+    - builds a package base once per run, then reuses artifacts for additional split outputs
+    - installs split outputs independently (e.g. one output without force-installing sibling outputs)
+    - handles split outputs that depend on other outputs from the same `pkgbase`
+- Failure-tolerant execution:
+  - `-S` attempts AUR fallback for requested targets when repo install fails.
+  - Dependency installation can fall back from repo packages to AUR providers.
+  - `-Syu` continues to AUR upgrade phase even if repo sync/upgrade fails.
+- Network robustness:
+  - Retry/backoff for AUR RPC calls (`curl`).
+  - Retry/backoff for AUR git synchronization (`clone`/`fetch`).
+- Persistent state and recovery:
+  - Caches AUR info and AUR git repositories.
+  - Stores reviewed commit snapshots for PKGBUILD diffing.
+  - Tracks failed package sets for `--resume-failed`.
+
+## Runtime Options
+
+- `-h`, `--help`: show help.
+- `--version`: show version.
 - `--dry-run`: print mutating actions without executing them.
 - `--json`: machine-readable summaries for key flows.
 - `--assume-reviewed`: skip interactive review prompts.
 - `--i-know-what-im-doing`: required with `--assume-reviewed` in non-interactive runs.
-- `--cache-info`: show cache location/size.
-- `--cache-clean`: clear melon cache state.
-- `--resume-failed`: retry last failed package set.
-- `--[no]pgpfetch`: prompt to import PGP keys from PKGBUILDs.
-- `--[no]useask`: automatically resolve conflicts using pacman's ask flag.
-- `--[no]savechanges`: commit changes to PKGBUILDs made during review.
-- `--[no]newsonupgrade`: print new news during sysupgrade.
-- `--[no]combinedupgrade`: refresh then perform the repo and AUR upgrade together.
-- `--[no]batchinstall`: build multiple AUR packages then install them together.
-- `--[no]provides`: look for matching providers when searching for packages.
-- `--[no]devel`: check development packages during sysupgrade.
-- `--[no]installdebug`: also install debug packages when a package provides them.
-- `--[no]sudoloop`: loop sudo calls in the background to avoid timeout.
-- `--[no]chroot`: build packages in a chroot.
-- `--[no]failfast`: exit as soon as building an AUR package fails.
-- `--[no]keepsrc`: keep `src/` and `pkg/` dirs after building packages.
-- `--[no]sign`: sign packages with gpg.
-- `--[no]signdb`: sign databases with gpg.
-- `--[no]localrepo`: build packages into a local repo.
+- `--cache-info`: show cache path and size.
+- `--cache-clean`: clear Melon cache.
+- `--resume-failed`: retry the last failed package set.
+- `--bottomup` / `--topdown`: control AUR search ordering.
+- `--[no]pgpfetch`: import PGP keys from PKGBUILDs when needed.
+- `--[no]useask`: use pacman's ask flag for conflict handling.
+- `--[no]savechanges`: commit PKGBUILD changes made during review.
+- `--[no]newsonupgrade`: show Arch news during sysupgrade.
+- `--[no]combinedupgrade`: combine refresh and repo/AUR upgrade.
+- `--[no]batchinstall`: build multiple AUR packages and install together.
+- `--[no]provides`: search provider matches.
+- `--[no]devel`: include development packages during sysupgrade checks.
+- `--[no]installdebug`: install debug companion packages when available.
+- `--[no]sudoloop`: keep sudo credentials warm in background.
+- `--[no]chroot`: build in chroot.
+- `--[no]failfast`: stop at first AUR build failure.
+- `--[no]keepsrc`: keep `src/` and `pkg/` after build.
+- `--[no]sign`: sign packages with GPG.
+- `--[no]signdb`: sign package databases with GPG.
+- `--[no]localrepo`: publish built packages into a local repo.
+- `--rebuild`: force matching targets to rebuild.
 
-## AUR review flow
+## Installation
 
-Before each AUR build, melon requires a review step (unless explicitly bypassed):
+### Build from source
 
-- `1` View raw `PKGBUILD` (classic pager view).
-- `2` View dependency summary.
-- `3` View full `.SRCINFO`.
-- `4` View `PKGBUILD` diff since last reviewed commit (when available).
-- `5` Run PKGBUILD security check (capability/risk summary).
-- `c` Continue build.
-- `a` Continue and trust remaining builds for this run.
-- `q` Abort.
+```bash
+zig build -Doptimize=ReleaseSafe
+./zig-out/bin/melon --help
+```
 
-Security check (`5`) is required before `c`/`a` for that review prompt.
+### Install locally (binary + shell completions)
 
-## Resilience and safety behavior
+```bash
+./install.sh
+```
 
-- Recursive AUR dependency resolution (`depends`, `makedepends`, `checkdepends`).
-- Best-effort fallback when official repo operations fail:
-  - `-S`: attempts AUR fallback for requested targets.
-  - dependency installs: tries AUR if repo dependency install fails.
-  - `-Syu`: continues to AUR phase even if repo sync fails.
-- Retry/backoff for AUR RPC (`curl`) and AUR git sync (`clone`/`fetch`).
-- Persistent cache:
-  - AUR info cache
-  - AUR git repo cache
-  - reviewed commit snapshots
-  - failed package set tracking
-- Structured failure report with step/package/command/hint.
+Environment overrides:
 
-## UX output
+- `PREFIX` (default: `/usr/local`)
+- `BIN_NAME` (default: `melon`)
+- `NO_SUDO=1` (disable sudo fallback)
+- `SKIP_BUILD=1` (install existing `zig-out/bin/melon`)
 
-- Phase/progress lines for install/upgrade flow.
-- End-of-run summary card:
-  - official/AUR targets
-  - AUR installed/upgraded
-  - failures
-  - cache hits/misses
-  - elapsed time
+Uninstall binary:
 
-## Build and test
+```bash
+./uninstall.sh
+```
+
+## Shell Completions
+
+Completions are shipped in `completions/` for:
+
+- bash: `completions/melon.bash`
+- zsh: `completions/melon.zsh`
+- fish: `completions/melon.fish`
+
+`install.sh` installs them into standard completion paths under `PREFIX`.
+
+## Build and Test
 
 ```bash
 zig build
@@ -100,7 +154,7 @@ ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache zig build
 ZIG_GLOBAL_CACHE_DIR=/tmp/zig-cache zig build test
 ```
 
-## Quick run examples
+## Quick Examples
 
 ```bash
 zig build run -- -Ss neovim
@@ -117,7 +171,7 @@ zig build run -- --resume-failed
 zig build run -- -Cbd
 ```
 
-## Runtime dependencies
+## Runtime Dependencies
 
 - `pacman`
 - `sudo` (for repo installs/upgrades)
@@ -126,15 +180,37 @@ zig build run -- -Cbd
 - `makepkg`
 - `vercmp` (from pacman)
 
-## Source layout
+## Repository Layout
 
-- `src/main.zig`: orchestration, review flow, UX/reporting.
-- `src/parsing.zig`: CLI/dependency parsing.
+- `src/main.zig`: orchestration, review flow, install/upgrade pipeline.
+- `src/parsing.zig`: CLI and dependency parsing.
 - `src/process.zig`: process execution helpers.
 - `src/ui.zig`: terminal UI helpers.
+- `src/reporting.zig`: run summaries and failure context.
 
-## Packaging and release
+## CI and Releases
 
-- `PKGBUILD` is included in repo and builds from git source.
-- CI runs `zig build` and `zig build test`.
-- Tagged releases (`v*`) publish Linux x86_64 binary artifacts.
+- CI validates formatting, build/test, install smoke paths, and Arch container builds.
+- Tagged releases (`v*`) publish Linux `x86_64` binary artifacts and SHA-256 checksums.
+
+## Validated Scenarios
+
+Automated fixture-based integration harness:
+
+- Script: `scripts/integration-aur.sh`
+- CI job: `Integration logic (fixture harness)` in `.github/workflows/ci.yml`
+- Validates:
+  - split outputs from one package base are built once and installed independently (`nxproxy` + `nxagent` topology)
+  - split outputs that depend on siblings from the same package base do not trigger false recursion/rebuild (`samsung-unified-driver` topology)
+  - non-local dependencies are still resolved normally (fixture `cups` repo dependency)
+
+Run locally:
+
+```bash
+./scripts/integration-aur.sh
+```
+
+Manual live-AUR smoke validation (performed on February 16, 2026):
+
+- `nxproxy` + `nxagent` (`PackageBase=nx`) reuse/build-selection behavior.
+- `samsung-unified-driver` split-output selection behavior.

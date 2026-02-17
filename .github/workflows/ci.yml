@@ -11,11 +11,40 @@ concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
 jobs:
+  fmt:
+    name: Zig format check
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      ZIG_GLOBAL_CACHE_DIR: ${{ github.workspace }}/.zig-global-cache
+      ZIG_LOCAL_CACHE_DIR: ${{ github.workspace }}/.zig-local-cache
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.15.2
+
+      - name: Verify formatting
+        run: |
+          set -euo pipefail
+          zig fmt --check build.zig src/*.zig
+
   checks:
     name: Checks (Zig 0.15.2)
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    needs: fmt
     env:
       ZIG_GLOBAL_CACHE_DIR: ${{ github.workspace }}/.zig-global-cache
       ZIG_LOCAL_CACHE_DIR: ${{ github.workspace }}/.zig-local-cache
@@ -39,7 +68,6 @@ jobs:
             ${{ runner.os }}-zig-0.15.2-
 
       - name: Build and test
-        shell: bash
         run: |
           set -euo pipefail
           echo "::group::Environment"
@@ -52,10 +80,81 @@ jobs:
           zig build test
           echo "::endgroup::"
 
+  install-smoke:
+    name: Install script smoke test
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    needs: checks
+    env:
+      ZIG_GLOBAL_CACHE_DIR: ${{ github.workspace }}/.zig-global-cache
+      ZIG_LOCAL_CACHE_DIR: ${{ github.workspace }}/.zig-local-cache
+      PREFIX: /tmp/melon-ci
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.15.2
+
+      - name: Build binary
+        run: |
+          set -euo pipefail
+          zig build -Doptimize=ReleaseSafe
+
+      - name: Install without sudo
+        run: |
+          set -euo pipefail
+          NO_SUDO=1 SKIP_BUILD=1 PREFIX="${PREFIX}" ./install.sh
+
+      - name: Validate installed files
+        run: |
+          set -euo pipefail
+          test -x "${PREFIX}/bin/melon"
+          "${PREFIX}/bin/melon" --version
+          test -f "${PREFIX}/share/bash-completion/completions/melon"
+          test -f "${PREFIX}/share/zsh/site-functions/_melon"
+          test -f "${PREFIX}/share/fish/vendor_completions.d/melon.fish"
+
+      - name: Uninstall binary
+        run: |
+          set -euo pipefail
+          PREFIX="${PREFIX}" ./uninstall.sh
+          test ! -e "${PREFIX}/bin/melon"
+
+  integration-logic:
+    name: Integration logic (fixture harness)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    needs: checks
+    env:
+      ZIG_GLOBAL_CACHE_DIR: ${{ github.workspace }}/.zig-global-cache
+      ZIG_LOCAL_CACHE_DIR: ${{ github.workspace }}/.zig-local-cache
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.15.2
+
+      - name: Build binary
+        run: |
+          set -euo pipefail
+          zig build -Doptimize=ReleaseSafe
+
+      - name: Run fixture integration harness
+        run: |
+          set -euo pipefail
+          ./scripts/integration-aur.sh
+
   arch-linux:
     name: Arch Linux build (pacman)
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    needs: checks
     container:
       image: archlinux:latest
     env:
@@ -66,7 +165,6 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Install toolchain
-        shell: bash
         run: |
           set -euo pipefail
           echo "::group::Pacman update"
@@ -77,7 +175,6 @@ jobs:
           echo "::endgroup::"
 
       - name: Build and test
-        shell: bash
         run: |
           set -euo pipefail
           echo "::group::Environment"

@@ -13,6 +13,10 @@ concurrency:
 permissions:
   contents: write
 
+defaults:
+  run:
+    shell: bash
+
 jobs:
   release:
     name: Build and publish release
@@ -43,18 +47,19 @@ jobs:
           echo "value=${VERSION}" >> "${GITHUB_OUTPUT}"
 
       - name: Build artifact
-        shell: bash
         run: |
           set -euo pipefail
           echo "::group::Environment"
           zig version
+          echo "::endgroup::"
+          echo "::group::Unit tests"
+          zig build test
           echo "::endgroup::"
           echo "::group::Build"
           zig build -Doptimize=ReleaseSafe -Dversion="${{ steps.version.outputs.value }}"
           echo "::endgroup::"
 
       - name: Package artifact
-        shell: bash
         run: |
           set -euo pipefail
           mkdir -p dist
