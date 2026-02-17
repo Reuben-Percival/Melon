@@ -22,10 +22,11 @@
 
 - Unified search and inspection:
   - `melon -Ss <query>` searches official repositories and AUR in one flow.
-  - `-Ss` supports interactive AUR install selection: number picks (`1 3 5`) or fuzzy multi-select via `fzf` (`f`).
+  - `-Ss` supports interactive AUR install selection: numbers/ranges/names (`1 3 5-7 ripgrep-git`), `a`/`all`, deselect with `^` (for example `a ^2 ^foo-git`), or fuzzy multi-select via `fzf` (`f`, with preview pane).
   - `melon -Si <package>` resolves package metadata with repo-first, AUR fallback behavior.
 - Mixed-target installs:
   - `melon -S [options] <targets...>` splits repo and AUR targets automatically.
+  - `melon -S --targets-file <path> [targets...]` reads additional package targets from file (whitespace/comma separated, `#` comments supported).
   - Supports shared install options such as `--needed` and `--noconfirm`.
   - Prints a post-install summary with requested/installed/skipped/failed counts and retry hint.
 - Upgrade workflows:

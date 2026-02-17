@@ -123,6 +123,7 @@ fn printUsage() void {
         \\    melon -Ss <query>        Search repos + AUR
         \\    melon -Si <package>      Show package info
         \\    melon -S <pkg...>        Install packages (repo first, AUR fallback)
+        \\    melon -S --targets-file <path> [pkg...]  Install packages from file + CLI
         \\    melon -Syu               Full upgrade: pacman sync + AUR updates
         \\    melon -Sua               Upgrade only installed AUR packages
         \\    melon -Qm                List foreign (AUR/manual) packages
@@ -143,12 +144,38 @@ fn installWithCompatibility(allocator: Allocator, raw_args: []const []const u8) 
     defer allocator.free(split.options);
     defer allocator.free(split.targets);
 
-    if (split.targets.len == 0) {
+    var effective_options = std.ArrayList([]const u8){};
+    defer effective_options.deinit(allocator);
+    var effective_targets = std.ArrayList([]const u8){};
+    defer effective_targets.deinit(allocator);
+    try effective_targets.appendSlice(allocator, split.targets);
+
+    var owned_file_targets = std.ArrayList([]const u8){};
+    defer {
+        for (owned_file_targets.items) |item| allocator.free(item);
+        owned_file_targets.deinit(allocator);
+    }
+
+    var i: usize = 0;
+    while (i < split.options.len) {
+        const opt = split.options[i];
+        if (eql(opt, "--targets-file")) {
+            if (i + 1 >= split.options.len) return usageErr("missing path after --targets-file");
+            const path = split.options[i + 1];
+            try appendTargetsFromFile(allocator, &effective_targets, &owned_file_targets, path);
+            i += 2;
+            continue;
+        }
+        try effective_options.append(allocator, opt);
+        i += 1;
+    }
+
+    if (effective_targets.items.len == 0) {
         section("pacman -S passthrough (no explicit targets)");
-        var pac_args = try allocator.alloc([]const u8, 1 + split.options.len);
+        var pac_args = try allocator.alloc([]const u8, 1 + effective_options.items.len);
         defer allocator.free(pac_args);
         pac_args[0] = "-S";
-        @memcpy(pac_args[1..], split.options);
+        @memcpy(pac_args[1..], effective_options.items);
         const rc = try runPacmanSudo(allocator, pac_args);
         if (rc != 0) return error.PacmanInstallFailed;
         return;
@@ -156,13 +183,13 @@ fn installWithCompatibility(allocator: Allocator, raw_args: []const []const u8) 
 
     var summary = InstallSummary{
         .started_ns = std.time.nanoTimestamp(),
-        .requested_targets = split.targets.len,
+        .requested_targets = effective_targets.items.len,
     };
     defer printInstallSummary(summary);
 
     var official_count: usize = 0;
     var aur_count: usize = 0;
-    for (split.targets) |target| {
+    for (effective_targets.items) |target| {
         if (try isOfficialPackage(allocator, target)) official_count += 1 else aur_count += 1;
     }
     summary.official_targets = official_count;
@@ -175,7 +202,7 @@ fn installWithCompatibility(allocator: Allocator, raw_args: []const []const u8) 
 
     var oi: usize = 0;
     var ai: usize = 0;
-    for (split.targets) |target| {
+    for (effective_targets.items) |target| {
         if (try isOfficialPackage(allocator, target)) {
             official_targets[oi] = target;
             oi += 1;
@@ -187,7 +214,7 @@ fn installWithCompatibility(allocator: Allocator, raw_args: []const []const u8) 
 
     if (official_targets.len > 0) {
         section("install official targets");
-        installOfficialTargets(allocator, split.options, official_targets) catch |err| {
+        installOfficialTargets(allocator, effective_options.items, official_targets) catch |err| {
             summary.failures += 1;
             if (summary.failed_target == null) summary.failed_target = "official-repos";
             return err;
@@ -220,9 +247,18 @@ fn splitInstallArgs(allocator: Allocator, raw_args: []const []const u8) !SplitIn
     var opt_count: usize = 0;
     var target_count: usize = 0;
     var parsing_options = true;
-    for (raw_args) |arg| {
+    var i: usize = 0;
+    while (i < raw_args.len) {
+        const arg = raw_args[i];
         if (parsing_options and eql(arg, "--")) {
             parsing_options = false;
+            i += 1;
+            continue;
+        }
+        if (parsing_options and eql(arg, "--targets-file")) {
+            if (i + 1 >= raw_args.len) return error.InvalidArguments;
+            opt_count += 2;
+            i += 2;
             continue;
         }
         if (parsing_options and arg.len > 0 and arg[0] == '-') {
@@ -230,6 +266,7 @@ fn splitInstallArgs(allocator: Allocator, raw_args: []const []const u8) !SplitIn
         } else {
             target_count += 1;
         }
+        i += 1;
     }
 
     var options = try allocator.alloc([]const u8, opt_count);
@@ -238,9 +275,20 @@ fn splitInstallArgs(allocator: Allocator, raw_args: []const []const u8) !SplitIn
     var oi: usize = 0;
     var ti: usize = 0;
     parsing_options = true;
-    for (raw_args) |arg| {
+    i = 0;
+    while (i < raw_args.len) {
+        const arg = raw_args[i];
         if (parsing_options and eql(arg, "--")) {
             parsing_options = false;
+            i += 1;
+            continue;
+        }
+        if (parsing_options and eql(arg, "--targets-file")) {
+            if (i + 1 >= raw_args.len) return error.InvalidArguments;
+            options[oi] = arg;
+            options[oi + 1] = raw_args[i + 1];
+            oi += 2;
+            i += 2;
             continue;
         }
         if (parsing_options and arg.len > 0 and arg[0] == '-') {
@@ -250,6 +298,7 @@ fn splitInstallArgs(allocator: Allocator, raw_args: []const []const u8) !SplitIn
             targets[ti] = arg;
             ti += 1;
         }
+        i += 1;
     }
     return .{ .options = options, .targets = targets };
 }
@@ -342,27 +391,50 @@ fn maybeHandleSearchSelection(allocator: Allocator, aur_results: []const AurSear
 
     std.debug.print("\n", .{});
     std.debug.print("Install from AUR results:\n", .{});
-    std.debug.print("  - Enter numbers (example: 1 3 5)\n", .{});
+    std.debug.print("  - Enter numbers/ranges/names (example: 1 3 5-7 ripgrep-git)\n", .{});
+    std.debug.print("  - Enter 'a' to select all, prefix with '^' to deselect (example: a ^2 ^4-6)\n", .{});
     std.debug.print("  - Enter 'f' for fuzzy multi-select (fzf)\n", .{});
     std.debug.print("  - Press Enter to skip\n", .{});
 
-    const choice = try promptLine(allocator, "Select packages: ");
-    defer allocator.free(choice);
-    if (choice.len == 0) return;
+    while (true) {
+        const choice = try promptLine(allocator, "Select packages: ");
+        defer allocator.free(choice);
+        if (choice.len == 0 or std.ascii.eqlIgnoreCase(choice, "n") or std.ascii.eqlIgnoreCase(choice, "none")) return;
 
-    const selected = if (eql(choice, "f"))
-        try selectAurPackagesWithFzf(allocator, aur_results)
-    else
-        try selectAurPackagesByNumber(allocator, choice, aur_results);
-    defer freeNameList(allocator, selected);
+        const selected = blk: {
+            if (std.ascii.eqlIgnoreCase(choice, "a") or std.ascii.eqlIgnoreCase(choice, "all")) {
+                break :blk try selectAllAurPackages(allocator, aur_results);
+            }
+            if (std.ascii.eqlIgnoreCase(choice, "f")) {
+                break :blk try selectAurPackagesWithFzf(allocator, aur_results);
+            }
+            break :blk selectAurPackagesByNumber(allocator, choice, aur_results) catch {
+                warnLine("invalid selection; use numbers/ranges like '1 3 5-7', or 'a', or 'f'");
+                continue;
+            };
+        };
+        defer freeNameList(allocator, selected);
 
-    if (selected.len == 0) {
-        warnLine("no packages selected");
+        if (selected.len == 0) {
+            warnLine("no packages selected");
+            continue;
+        }
+
+        std.debug.print("Selected {d} package(s):\n", .{selected.len});
+        for (selected) |pkg| {
+            std.debug.print("  - {s}\n", .{pkg});
+        }
+        const confirm = try promptLine(allocator, "Proceed with install? [Y/n]: ");
+        defer allocator.free(confirm);
+        if (!(confirm.len == 0 or std.ascii.eqlIgnoreCase(confirm, "y") or std.ascii.eqlIgnoreCase(confirm, "yes"))) {
+            warnLine("selection canceled");
+            return;
+        }
+
+        section("install selected AUR packages");
+        try installWithCompatibility(allocator, selected);
         return;
     }
-
-    section("install selected AUR packages");
-    try installWithCompatibility(allocator, selected);
 }
 
 fn selectAurPackagesByNumber(allocator: Allocator, raw: []const u8, aur_results: []const AurSearchResult) ![]const []const u8 {
@@ -378,20 +450,111 @@ fn selectAurPackagesByNumber(allocator: Allocator, raw: []const u8, aur_results:
 
     var tok = std.mem.tokenizeAny(u8, raw, ", \t");
     while (tok.next()) |part| {
-        const idx = std.fmt.parseInt(usize, part, 10) catch {
-            errLineFmt("invalid selection token: {s}", .{part});
+        var select_value = true;
+        var token = part;
+        if (token.len > 0 and (token[0] == '^' or token[0] == '!')) {
+            select_value = false;
+            token = token[1..];
+            if (token.len == 0) {
+                errLineFmt("invalid selection token: {s}", .{part});
+                return error.InvalidArguments;
+            }
+        }
+
+        if (std.ascii.eqlIgnoreCase(token, "a") or std.ascii.eqlIgnoreCase(token, "all")) {
+            @memset(picked, select_value);
+            continue;
+        }
+
+        if (std.mem.indexOfScalar(u8, token, '-')) |dash| {
+            if (dash == 0 or dash + 1 >= part.len) {
+                errLineFmt("invalid range token: {s}", .{part});
+                return error.InvalidArguments;
+            }
+            var start = std.fmt.parseInt(usize, token[0..dash], 10) catch {
+                errLineFmt("invalid range token: {s}", .{part});
+                return error.InvalidArguments;
+            };
+            var end = std.fmt.parseInt(usize, token[dash + 1 ..], 10) catch {
+                errLineFmt("invalid range token: {s}", .{part});
+                return error.InvalidArguments;
+            };
+            if (start == 0 or end == 0 or start > aur_results.len or end > aur_results.len) {
+                errLineFmt("selection range out of bounds: {s}", .{part});
+                return error.InvalidArguments;
+            }
+            if (start > end) std.mem.swap(usize, &start, &end);
+            var idx = start;
+            while (idx <= end) : (idx += 1) {
+                picked[idx - 1] = select_value;
+            }
+            continue;
+        }
+
+        if (std.fmt.parseInt(usize, token, 10)) |idx| {
+            if (idx == 0 or idx > aur_results.len) {
+                errLineFmt("selection out of range: {d}", .{idx});
+                return error.InvalidArguments;
+            }
+            picked[idx - 1] = select_value;
+            continue;
+        } else |_| {}
+
+        const name_idx = indexOfAurResultByName(aur_results, token) orelse {
+            errLineFmt("unknown package in selection: {s}", .{token});
             return error.InvalidArguments;
         };
-        if (idx == 0 or idx > aur_results.len) {
-            errLineFmt("selection out of range: {d}", .{idx});
-            return error.InvalidArguments;
-        }
-        const pos = idx - 1;
-        if (picked[pos]) continue;
-        picked[pos] = true;
-        try selected.append(allocator, try allocator.dupe(u8, aur_results[pos].name));
+        picked[name_idx] = select_value;
     }
 
+    for (aur_results, 0..) |item, idx| {
+        if (!picked[idx]) continue;
+        try selected.append(allocator, try allocator.dupe(u8, item.name));
+    }
+
+    return selected.toOwnedSlice(allocator);
+}
+
+fn appendTargetsFromFile(
+    allocator: Allocator,
+    effective_targets: *std.ArrayList([]const u8),
+    owned_file_targets: *std.ArrayList([]const u8),
+    path: []const u8,
+) !void {
+    const data = try std.fs.cwd().readFileAlloc(allocator, path, 8 * 1024 * 1024);
+    defer allocator.free(data);
+
+    var line_it = std.mem.splitScalar(u8, data, '\n');
+    while (line_it.next()) |line| {
+        const trimmed = std.mem.trim(u8, line, " \t\r");
+        if (trimmed.len == 0 or trimmed[0] == '#') continue;
+
+        var tok = std.mem.tokenizeAny(u8, trimmed, " \t,");
+        while (tok.next()) |pkg| {
+            if (pkg.len == 0) continue;
+            const duped = try allocator.dupe(u8, pkg);
+            try owned_file_targets.append(allocator, duped);
+            try effective_targets.append(allocator, duped);
+        }
+    }
+}
+
+fn indexOfAurResultByName(aur_results: []const AurSearchResult, name: []const u8) ?usize {
+    for (aur_results, 0..) |item, idx| {
+        if (std.ascii.eqlIgnoreCase(item.name, name)) return idx;
+    }
+    return null;
+}
+
+fn selectAllAurPackages(allocator: Allocator, aur_results: []const AurSearchResult) ![]const []const u8 {
+    var selected = std.ArrayList([]const u8){};
+    errdefer {
+        for (selected.items) |name| allocator.free(name);
+        selected.deinit(allocator);
+    }
+    for (aur_results) |item| {
+        try selected.append(allocator, try allocator.dupe(u8, item.name));
+    }
     return selected.toOwnedSlice(allocator);
 }
 
@@ -416,7 +579,7 @@ fn selectAurPackagesWithFzf(allocator: Allocator, aur_results: []const AurSearch
 
     const cmd = try std.fmt.allocPrint(
         allocator,
-        "fzf --multi --delimiter=$'\\t' --with-nth=2,3,4 --prompt='Select AUR package(s)> ' < {s}",
+        "fzf --multi --delimiter=$'\\t' --with-nth=2,3,4 --preview='printf \"name: %s\\nversion: %s\\n\\n%s\\n\" {{2}} {{3}} {{4}}' --preview-window='down,60%,wrap' --prompt='Select AUR package(s)> ' --bind='ctrl-a:select-all,ctrl-d:deselect-all' < '{s}'",
         .{temp_path},
     );
     defer allocator.free(cmd);
@@ -556,7 +719,7 @@ fn installAurPackageRecursive(allocator: Allocator, ctx: *InstallContext, pkg: [
         return error.DependencyCycle;
     }
     try ctx.visiting_aur.put(try ctx.allocator.dupe(u8, repo_base), {});
-    errdefer _ = ctx.visiting_aur.remove(repo_base);
+    errdefer removeStringSetEntry(ctx.allocator, &ctx.visiting_aur, repo_base);
 
     const now = std.time.timestamp();
     const build_dir = try std.fmt.allocPrint(allocator, "/tmp/melon-{s}-{d}", .{ repo_base, now });
@@ -577,7 +740,7 @@ fn installAurPackageRecursive(allocator: Allocator, ctx: *InstallContext, pkg: [
     const mk_rc = try runStreamingCwd(allocator, build_dir, &.{ "makepkg", "-si", "--noconfirm" });
     if (mk_rc != 0) return error.MakepkgFailed;
 
-    _ = ctx.visiting_aur.remove(repo_base);
+    removeStringSetEntry(ctx.allocator, &ctx.visiting_aur, repo_base);
     try ctx.installed_aur.put(try ctx.allocator.dupe(u8, repo_base), {});
 }
 
@@ -991,6 +1154,12 @@ fn freeStringSetKeys(allocator: Allocator, set: *std.StringHashMap(void)) void {
     var it = set.keyIterator();
     while (it.next()) |key| {
         allocator.free(key.*);
+    }
+}
+
+fn removeStringSetEntry(allocator: Allocator, set: *std.StringHashMap(void), key: []const u8) void {
+    if (set.fetchRemove(key)) |removed| {
+        allocator.free(removed.key);
     }
 }
 

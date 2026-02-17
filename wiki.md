@@ -16,7 +16,8 @@ Primary reference remains `README.md`. This wiki provides operational notes and 
 - `-S` post-run summary reports requested/installed/skipped/failed counts with retry hint.
 - `-Syu`: full system upgrade plus AUR upgrade pass.
 - `-Sua`: AUR/foreign-only upgrade.
-- `-Ss`: supports interactive AUR install picks by number, plus fuzzy multi-select when `fzf` is available.
+- `-Ss`: supports interactive AUR install picks by number/range/name (`1 3 5-7 ripgrep-git`), `a`/`all` for all, `^` to deselect (for example `a ^2 ^foo-git`), plus fuzzy multi-select when `fzf` is available (with preview pane).
+- `-S --targets-file <path>`: batch install packages from file (blank lines and `#` comments ignored).
 - `-Qu`/`-Qua`: update check without install.
 - `-G`: clone AUR repos (parallelized when cloning multiple targets).
 - pacman passthrough: non-overridden pacman flags are forwarded with root-op detection and exit-code propagation.
