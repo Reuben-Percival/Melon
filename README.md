@@ -124,7 +124,7 @@ Environment overrides:
 - `NO_SUDO=1` (disable sudo fallback)
 - `SKIP_BUILD=1` (install existing `zig-out/bin/melon`)
 
-Uninstall binary:
+Uninstall binary and installed shell completions:
 
 ```bash
 ./uninstall.sh
