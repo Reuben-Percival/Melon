@@ -1492,12 +1492,8 @@ fn reviewAurPackage(allocator: Allocator, ctx: *InstallContext, build_dir: []con
     std.debug.print("  2) View dependency summary\n", .{});
     std.debug.print("  3) View full .SRCINFO\n", .{});
     std.debug.print("  4) View source diff (PKGBUILD/.install/.patch/etc)\n", .{});
-<<<<<<< HEAD
-    std.debug.print("  5) Run PKGBUILD security check + source/checksum summary\n", .{});
-=======
     std.debug.print("  5) Run PKGBUILD security check\n", .{});
     std.debug.print("  6) View source/checksum/signature summary\n", .{});
->>>>>>> main/main
     std.debug.print("  c) Continue build\n", .{});
     std.debug.print("  a) Continue and trust all for this run\n", .{});
     std.debug.print("  s) Skip this package (continue run)\n", .{});
