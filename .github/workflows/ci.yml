@@ -19,6 +19,17 @@ defaults:
     shell: bash
 
 jobs:
+  workflow-lint:
+    name: Workflow lint
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Lint GitHub workflows
+        uses: rhysd/actionlint@main
+
   fmt:
     name: Zig format check
     runs-on: ubuntu-latest
@@ -40,11 +51,36 @@ jobs:
           set -euo pipefail
           zig fmt --check build.zig src/*.zig
 
+  shellcheck:
+    name: Shell script lint
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    needs: fmt
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install shellcheck
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y shellcheck
+
+      - name: Lint scripts
+        run: |
+          set -euo pipefail
+          bash -n install.sh uninstall.sh scripts/integration-aur.sh
+          shellcheck install.sh uninstall.sh scripts/integration-aur.sh
+
   checks:
-    name: Checks (Zig 0.15.2)
+    name: Checks (Zig ${{ matrix.zig }})
     runs-on: ubuntu-latest
     timeout-minutes: 15
-    needs: fmt
+    needs: [workflow-lint, fmt, shellcheck]
+    strategy:
+      fail-fast: false
+      matrix:
+        zig: ["0.14.1", "0.15.2"]
     env:
       ZIG_GLOBAL_CACHE_DIR: ${{ github.workspace }}/.zig-global-cache
       ZIG_LOCAL_CACHE_DIR: ${{ github.workspace }}/.zig-local-cache
@@ -55,7 +91,7 @@ jobs:
       - name: Setup Zig
         uses: mlugg/setup-zig@v2
         with:
-          version: 0.15.2
+          version: ${{ matrix.zig }}
 
       - name: Cache Zig directories
         uses: actions/cache@v4
@@ -63,9 +99,9 @@ jobs:
           path: |
             .zig-global-cache
             .zig-local-cache
-          key: ${{ runner.os }}-zig-0.15.2-${{ hashFiles('build.zig', 'build.zig.zon', 'src/**', 'README.md') }}
+          key: ${{ runner.os }}-zig-${{ matrix.zig }}-${{ hashFiles('build.zig', 'build.zig.zon', 'src/**', 'README.md') }}
           restore-keys: |
-            ${{ runner.os }}-zig-0.15.2-
+            ${{ runner.os }}-zig-${{ matrix.zig }}-
 
       - name: Build and test
         run: |
@@ -120,8 +156,11 @@ jobs:
       - name: Uninstall binary
         run: |
           set -euo pipefail
-          PREFIX="${PREFIX}" ./uninstall.sh
+          NO_SUDO=1 PREFIX="${PREFIX}" ./uninstall.sh
           test ! -e "${PREFIX}/bin/melon"
+          test ! -e "${PREFIX}/share/bash-completion/completions/melon"
+          test ! -e "${PREFIX}/share/zsh/site-functions/_melon"
+          test ! -e "${PREFIX}/share/fish/vendor_completions.d/melon.fish"
 
   integration-logic:
     name: Integration logic (fixture harness)

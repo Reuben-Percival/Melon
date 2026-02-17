@@ -68,8 +68,34 @@ pub fn errLineFmt(comptime fmt: []const u8, args: anytype) void {
 pub fn promptLine(allocator: Allocator, prompt: []const u8) ![]u8 {
     std.debug.print("{s}", .{prompt});
     var line_buf: [256]u8 = undefined;
-    const line_opt = try std.fs.File.stdin().deprecatedReader().readUntilDelimiterOrEof(line_buf[0..], '\n');
+    const line_opt = try readStdinLine(line_buf[0..]);
     const line = line_opt orelse return allocator.dupe(u8, "");
     const trimmed = std.mem.trim(u8, line, " \t\r\n");
     return allocator.dupe(u8, trimmed);
+}
+
+fn readStdinLine(buf: []u8) !?[]u8 {
+    if (@hasDecl(std.fs.File, "stdin")) {
+        const stdin_file = std.fs.File.stdin();
+        if (@hasDecl(@TypeOf(stdin_file), "deprecatedReader")) {
+            return stdin_file.deprecatedReader().readUntilDelimiterOrEof(buf, '\n');
+        }
+    }
+    if (@hasDecl(std, "io")) {
+        if (@hasDecl(std.io, "getStdIn")) {
+            const stdin_file = std.io.getStdIn();
+            if (@hasDecl(@TypeOf(stdin_file), "deprecatedReader")) {
+                return stdin_file.deprecatedReader().readUntilDelimiterOrEof(buf, '\n');
+            }
+        }
+    }
+    if (@hasDecl(std, "Io")) {
+        if (@hasDecl(std.Io, "getStdIn")) {
+            const stdin_file = std.Io.getStdIn();
+            if (@hasDecl(@TypeOf(stdin_file), "deprecatedReader")) {
+                return stdin_file.deprecatedReader().readUntilDelimiterOrEof(buf, '\n');
+            }
+        }
+    }
+    return error.UnsupportedStdin;
 }

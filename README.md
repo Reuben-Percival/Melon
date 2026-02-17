@@ -43,9 +43,15 @@ Before each AUR build (unless explicitly bypassed), Melon requires an interactiv
 - `2`: view dependency summary.
 - `3`: view full `.SRCINFO`.
 - `4`: view source diff since last reviewed commit (`PKGBUILD`, `.install`, patches, and other tracked build files).
+<<<<<<< HEAD
 - `5`: run PKGBUILD security check (capabilities, risky markers, unsafe makepkg flags such as `!strip`, `!check`, `!fortify`) plus source/checksum summary from `.SRCINFO`.
+=======
+- `5`: run PKGBUILD security check (capabilities, risky markers, unsafe makepkg flags such as `!strip`, `!check`, `!fortify`).
+- `6`: view source/checksum/signature summary (`source`, checksum arrays, `validpgpkeys`).
+>>>>>>> main/main
 - `c`: continue build.
 - `a`: continue and trust remaining packages for the current run.
+- `s`: skip this package and continue the run.
 - `q`: abort.
 
 `5` (security check) is required before `c`/`a` for that prompt.
@@ -124,7 +130,7 @@ Environment overrides:
 - `NO_SUDO=1` (disable sudo fallback)
 - `SKIP_BUILD=1` (install existing `zig-out/bin/melon`)
 
-Uninstall binary:
+Uninstall binary and installed shell completions:
 
 ```bash
 ./uninstall.sh
@@ -187,10 +193,18 @@ zig build run -- -Cbd
 - `src/process.zig`: process execution helpers.
 - `src/ui.zig`: terminal UI helpers.
 - `src/reporting.zig`: run summaries and failure context.
+- `src/json_helpers.zig`: shared JSON field extraction helpers.
 
 ## CI and Releases
 
-- CI validates formatting, build/test, install smoke paths, and Arch container builds.
+- CI validates:
+  - workflow syntax (`actionlint`)
+  - Zig formatting (`zig fmt --check`)
+  - shell scripts (`bash -n` + `shellcheck`)
+  - build/test across Zig `0.14.1` and `0.15.2`
+  - install/uninstall smoke paths
+  - integration logic harness
+  - Arch Linux container build/test
 - Tagged releases (`v*`) publish Linux `x86_64` binary artifacts and SHA-256 checksums.
 
 ## Validated Scenarios
