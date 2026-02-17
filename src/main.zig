@@ -3,6 +3,7 @@ const parsing = @import("parsing.zig");
 const process = @import("process.zig");
 const ui = @import("ui.zig");
 const reporting = @import("reporting.zig");
+const json_helpers = @import("json_helpers.zig");
 
 const Allocator = std.mem.Allocator;
 const RunConfig = parsing.RunConfig;
@@ -17,6 +18,11 @@ const startsWithAny = parsing.startsWithAny;
 const containsArg = parsing.containsArg;
 const eql = parsing.eql;
 const urlEncode = parsing.urlEncode;
+const getValue = json_helpers.getValue;
+const getString = json_helpers.getString;
+const getArray = json_helpers.getArray;
+const getInt = json_helpers.getInt;
+const getFloat = json_helpers.getFloat;
 
 const runStreaming = process.runStreaming;
 const runStreamingCwd = process.runStreamingCwd;
@@ -2527,38 +2533,6 @@ fn runCaptureRetry(allocator: Allocator, argv: []const []const u8, max_attempts:
         delay *= 2;
     }
     return error.CommandFailed;
-}
-
-fn getValue(v: std.json.Value, key: []const u8) ?std.json.Value {
-    if (v != .object) return null;
-    return v.object.get(key);
-}
-
-fn getString(v: std.json.Value, key: []const u8) ?[]const u8 {
-    const candidate = getValue(v, key) orelse return null;
-    if (candidate != .string) return null;
-    return candidate.string;
-}
-
-fn getArray(v: std.json.Value, key: []const u8) ?std.json.Array {
-    const candidate = getValue(v, key) orelse return null;
-    if (candidate != .array) return null;
-    return candidate.array;
-}
-
-fn getInt(v: std.json.Value, key: []const u8) ?i64 {
-    const candidate = getValue(v, key) orelse return null;
-    if (candidate != .integer) return null;
-    return candidate.integer;
-}
-
-fn getFloat(v: std.json.Value, key: []const u8) ?f64 {
-    const candidate = getValue(v, key) orelse return null;
-    return switch (candidate) {
-        .float => candidate.float,
-        .integer => @as(f64, @floatFromInt(candidate.integer)),
-        else => null,
-    };
 }
 
 fn freeStringSetKeys(allocator: Allocator, set: *std.StringHashMap(void)) void {

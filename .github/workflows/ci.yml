@@ -40,11 +40,31 @@ jobs:
           set -euo pipefail
           zig fmt --check build.zig src/*.zig
 
+  shellcheck:
+    name: Shell script lint
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    needs: fmt
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install shellcheck
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y shellcheck
+
+      - name: Lint scripts
+        run: |
+          set -euo pipefail
+          shellcheck install.sh uninstall.sh scripts/integration-aur.sh
+
   checks:
     name: Checks (Zig 0.15.2)
     runs-on: ubuntu-latest
     timeout-minutes: 15
-    needs: fmt
+    needs: [fmt, shellcheck]
     env:
       ZIG_GLOBAL_CACHE_DIR: ${{ github.workspace }}/.zig-global-cache
       ZIG_LOCAL_CACHE_DIR: ${{ github.workspace }}/.zig-local-cache
@@ -120,8 +140,11 @@ jobs:
       - name: Uninstall binary
         run: |
           set -euo pipefail
-          PREFIX="${PREFIX}" ./uninstall.sh
+          NO_SUDO=1 PREFIX="${PREFIX}" ./uninstall.sh
           test ! -e "${PREFIX}/bin/melon"
+          test ! -e "${PREFIX}/share/bash-completion/completions/melon"
+          test ! -e "${PREFIX}/share/zsh/site-functions/_melon"
+          test ! -e "${PREFIX}/share/fish/vendor_completions.d/melon.fish"
 
   integration-logic:
     name: Integration logic (fixture harness)
