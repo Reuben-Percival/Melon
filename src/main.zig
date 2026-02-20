@@ -769,7 +769,7 @@ fn aurUpgrade(allocator: Allocator) !void {
         kv("current", upg.current);
         kv("latest", upg.latest);
         installAurPackageRecursive(allocator, &ctx, upg.base, false) catch |err| {
-            errLineFmt("failed to upgrade {s}: {s}", .{upg.pkg, @errorName(err)});
+            errLineFmt("failed to upgrade {s}: {s}", .{ upg.pkg, @errorName(err) });
             continue;
         };
         upgraded += 1;
