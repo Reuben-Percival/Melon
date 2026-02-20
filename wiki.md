@@ -64,7 +64,7 @@ CI includes:
 - workflow lint (`actionlint`)
 - Zig fmt check
 - shell script lint (`bash -n`, `shellcheck`)
-- build/test matrix on Zig `0.14.1` and `0.15.2`
+- build/test on Zig `0.15.2`
 - install/uninstall smoke test
 - integration fixture harness
 - Arch Linux container build/test

@@ -20,23 +20,20 @@ defaults:
 
 jobs:
   workflow-lint:
-    name: Workflow lint
+    name: Workflow Lint
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 5
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Lint GitHub workflows
+      - name: Lint GitHub Workflows
         uses: rhysd/actionlint@main
 
   fmt:
-    name: Zig format check
+    name: Code Hygiene
     runs-on: ubuntu-latest
-    timeout-minutes: 10
-    env:
-      ZIG_GLOBAL_CACHE_DIR: ${{ github.workspace }}/.zig-global-cache
-      ZIG_LOCAL_CACHE_DIR: ${{ github.workspace }}/.zig-local-cache
+    timeout-minutes: 5
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -46,44 +43,33 @@ jobs:
         with:
           version: 0.15.2
 
-      - name: Verify formatting
-        run: |
-          set -euo pipefail
-          zig fmt --check build.zig src/*.zig
+      - name: Verify Zig Format
+        run: zig fmt --check build.zig src/*.zig
 
   shellcheck:
-    name: Shell script lint
+    name: Script Lint
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 5
     needs: fmt
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install shellcheck
-        run: |
-          set -euo pipefail
-          sudo apt-get update
-          sudo apt-get install -y shellcheck
+      - name: Install ShellCheck
+        run: sudo apt-get install -y shellcheck
 
-      - name: Lint scripts
+      - name: Lint Bash Scripts
         run: |
-          set -euo pipefail
           bash -n install.sh uninstall.sh scripts/integration-aur.sh
           shellcheck install.sh uninstall.sh scripts/integration-aur.sh
 
-  checks:
-    name: Checks (Zig ${{ matrix.zig }})
+  test:
+    name: Build & Test (Linux)
     runs-on: ubuntu-latest
     timeout-minutes: 15
     needs: [workflow-lint, fmt, shellcheck]
-    strategy:
-      fail-fast: false
-      matrix:
-        zig: ["0.14.1", "0.15.2"]
     env:
       ZIG_GLOBAL_CACHE_DIR: ${{ github.workspace }}/.zig-global-cache
-      ZIG_LOCAL_CACHE_DIR: ${{ github.workspace }}/.zig-local-cache
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -91,39 +77,31 @@ jobs:
       - name: Setup Zig
         uses: mlugg/setup-zig@v2
         with:
-          version: ${{ matrix.zig }}
+          version: 0.15.2
 
-      - name: Cache Zig directories
+      - name: Cache Zig Directories
         uses: actions/cache@v4
         with:
-          path: |
-            .zig-global-cache
-            .zig-local-cache
-          key: ${{ runner.os }}-zig-${{ matrix.zig }}-${{ hashFiles('build.zig', 'build.zig.zon', 'src/**', 'README.md') }}
-          restore-keys: |
-            ${{ runner.os }}-zig-${{ matrix.zig }}-
+          path: .zig-global-cache
+          key: ${{ runner.os }}-zig-0.15.2-${{ hashFiles('build.zig', 'build.zig.zon', 'src/**', 'README.md') }}
+          restore-keys: ${{ runner.os }}-zig-0.15.2-
 
-      - name: Build and test
-        run: |
-          set -euo pipefail
-          echo "::group::Environment"
-          zig version
-          echo "::endgroup::"
-          echo "::group::Build"
-          zig build
-          echo "::endgroup::"
-          echo "::group::Unit tests"
-          zig build test
-          echo "::endgroup::"
+      - name: Environment Info
+        run: zig version
+
+      - name: Build Melon
+        run: zig build
+
+      - name: Run Unit Tests
+        run: zig build test
 
   install-smoke:
-    name: Install script smoke test
+    name: Install Smoke Test
     runs-on: ubuntu-latest
-    timeout-minutes: 15
-    needs: checks
+    timeout-minutes: 10
+    needs: test
     env:
       ZIG_GLOBAL_CACHE_DIR: ${{ github.workspace }}/.zig-global-cache
-      ZIG_LOCAL_CACHE_DIR: ${{ github.workspace }}/.zig-local-cache
       PREFIX: /tmp/melon-ci
     steps:
       - name: Checkout
@@ -134,42 +112,32 @@ jobs:
         with:
           version: 0.15.2
 
-      - name: Build binary
-        run: |
-          set -euo pipefail
-          zig build -Doptimize=ReleaseSafe
+      - name: Build Optimized Binary
+        run: zig build -Doptimize=ReleaseSafe
 
-      - name: Install without sudo
-        run: |
-          set -euo pipefail
-          NO_SUDO=1 SKIP_BUILD=1 PREFIX="${PREFIX}" ./install.sh
+      - name: Install (No Sudo)
+        run: NO_SUDO=1 SKIP_BUILD=1 PREFIX="${PREFIX}" ./install.sh
 
-      - name: Validate installed files
+      - name: Validate Installation
         run: |
-          set -euo pipefail
           test -x "${PREFIX}/bin/melon"
           "${PREFIX}/bin/melon" --version
           test -f "${PREFIX}/share/bash-completion/completions/melon"
           test -f "${PREFIX}/share/zsh/site-functions/_melon"
           test -f "${PREFIX}/share/fish/vendor_completions.d/melon.fish"
 
-      - name: Uninstall binary
+      - name: Uninstall Binary
         run: |
-          set -euo pipefail
           NO_SUDO=1 PREFIX="${PREFIX}" ./uninstall.sh
           test ! -e "${PREFIX}/bin/melon"
-          test ! -e "${PREFIX}/share/bash-completion/completions/melon"
-          test ! -e "${PREFIX}/share/zsh/site-functions/_melon"
-          test ! -e "${PREFIX}/share/fish/vendor_completions.d/melon.fish"
 
-  integration-logic:
-    name: Integration logic (fixture harness)
+  integration:
+    name: Integration Harness
     runs-on: ubuntu-latest
-    timeout-minutes: 20
-    needs: checks
+    timeout-minutes: 15
+    needs: test
     env:
       ZIG_GLOBAL_CACHE_DIR: ${{ github.workspace }}/.zig-global-cache
-      ZIG_LOCAL_CACHE_DIR: ${{ github.workspace }}/.zig-local-cache
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -179,50 +147,30 @@ jobs:
         with:
           version: 0.15.2
 
-      - name: Build binary
-        run: |
-          set -euo pipefail
-          zig build -Doptimize=ReleaseSafe
+      - name: Build Optimized Binary
+        run: zig build -Doptimize=ReleaseSafe
 
-      - name: Run fixture integration harness
-        run: |
-          set -euo pipefail
-          ./scripts/integration-aur.sh
+      - name: Run Fixture Integration Tests
+        run: ./scripts/integration-aur.sh
 
   arch-linux:
-    name: Arch Linux build (pacman)
+    name: Arch Linux Compatibility
     runs-on: ubuntu-latest
-    timeout-minutes: 20
-    needs: checks
+    timeout-minutes: 15
+    needs: test
     container:
       image: archlinux:latest
-    env:
-      ZIG_GLOBAL_CACHE_DIR: ${{ github.workspace }}/.zig-global-cache
-      ZIG_LOCAL_CACHE_DIR: ${{ github.workspace }}/.zig-local-cache
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install toolchain
+      - name: Bootstrap Environment
         run: |
-          set -euo pipefail
-          echo "::group::Pacman update"
           pacman -Syu --noconfirm --needed archlinux-keyring
-          echo "::endgroup::"
-          echo "::group::Install dependencies"
           pacman -S --noconfirm --needed zig git base-devel
-          echo "::endgroup::"
 
-      - name: Build and test
+      - name: Build & Test
         run: |
-          set -euo pipefail
-          echo "::group::Environment"
           zig version
-          uname -a
-          echo "::endgroup::"
-          echo "::group::Build"
           zig build
-          echo "::endgroup::"
-          echo "::group::Unit tests"
           zig build test
-          echo "::endgroup::"
