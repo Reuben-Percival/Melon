@@ -1,0 +1,23 @@
+pkgbase = melon
+	pkgdesc = Minimal AUR helper written in Zig with mandatory PKGBUILD review
+	pkgver = r115.6acbc01
+	pkgrel = 1
+	url = https://github.com/Reuben-Percival/Melon
+	arch = x86_64
+	arch = aarch64
+	arch = armv7h
+	arch = riscv64
+	license = GPL2
+	makedepends = zig
+	makedepends = git
+	depends = pacman
+	depends = curl
+	depends = git
+	depends = sudo
+	optdepends = fzf: for fuzzy package selection
+	provides = melon
+	conflicts = melon-git
+	source = git+https://github.com/Reuben-Percival/Melon.git
+	sha256sums = SKIP
+
+pkgname = melon
