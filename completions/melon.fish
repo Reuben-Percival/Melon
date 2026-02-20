@@ -18,6 +18,9 @@ complete -c melon -f -n '__fish_use_subcommand' -a '-Cbd' -d 'Prune all unused d
 # Package name completion for -S, -Si, -G
 function __melon_list_packages
     pacman -Ssq $argv 2>/dev/null | head -100
+    if test -n "$argv"
+        curl -m 1 -s "https://aur.archlinux.org/rpc/v5/search/$argv" | grep -o '"Name":"[^"]*"' | cut -d'"' -f4 | head -100 2>/dev/null
+    end
 end
 
 function __melon_list_installed

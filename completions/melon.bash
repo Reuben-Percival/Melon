@@ -35,9 +35,14 @@ _melon() {
 
     case "${prev}" in
         -S|-Si|-G)
-            # Complete with available packages from pacman + AUR cache
+            # Complete with available packages from pacman + AUR
             if command -v pacman &>/dev/null; then
-                COMPREPLY=( $(compgen -W "$(pacman -Ssq "${cur}" 2>/dev/null | head -50)" -- "${cur}") )
+                local pac_pkgs=$(pacman -Ssq "${cur}" 2>/dev/null | head -50)
+                local aur_pkgs=""
+                if [[ -n "${cur}" ]]; then
+                    aur_pkgs=$(curl -m 1 -s "https://aur.archlinux.org/rpc/v5/search/${cur}" | grep -o '"Name":"[^"]*"' | cut -d'"' -f4 | head -50 2>/dev/null)
+                fi
+                COMPREPLY=( $(compgen -W "${pac_pkgs} ${aur_pkgs}" -- "${cur}") )
             fi
             return 0
             ;;

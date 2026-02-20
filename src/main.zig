@@ -665,7 +665,24 @@ fn aurUpgrade(allocator: Allocator) !void {
         return;
     }
 
-    var upgraded: usize = 0;
+    const PendingUpgrade = struct {
+        base: []const u8,
+        pkg: []const u8,
+        current: []const u8,
+        latest: []const u8,
+    };
+
+    var pending_upgrades = std.ArrayList(PendingUpgrade){};
+    defer {
+        for (pending_upgrades.items) |u| {
+            allocator.free(u.base);
+            allocator.free(u.pkg);
+            allocator.free(u.current);
+            allocator.free(u.latest);
+        }
+        pending_upgrades.deinit(allocator);
+    }
+
     var scanned: usize = 0;
     for (aur_list) |pkg| {
         scanned += 1;
@@ -685,17 +702,80 @@ fn aurUpgrade(allocator: Allocator) !void {
             if (seen_bases.contains(base)) continue;
             try seen_bases.put(try allocator.dupe(u8, base), {});
 
-            sectionFmt("upgrade aur/{s}", .{base});
-            kv("package", pkg);
-            kv("current", installed);
-            kv("latest", latest);
-            try installAurPackageRecursive(allocator, &ctx, base, false);
-            upgraded += 1;
+            try pending_upgrades.append(allocator, .{
+                .base = try allocator.dupe(u8, base),
+                .pkg = try allocator.dupe(u8, pkg),
+                .current = try allocator.dupe(u8, installed),
+                .latest = try allocator.dupe(u8, latest),
+            });
         }
     }
 
     rule();
     kvInt("scanned", scanned);
+
+    if (pending_upgrades.items.len == 0) {
+        okLine("AUR packages are up to date");
+        return;
+    }
+
+    std.debug.print("{s}AUR Updates:{s}\n", .{ color_title, color_reset });
+    for (pending_upgrades.items, 0..) |upg, i| {
+        std.debug.print("  {s}[{d}]{s} {s} ({s} -> {s})\n", .{ color_title, i + 1, color_reset, upg.pkg, upg.current, upg.latest });
+    }
+
+    std.debug.print("\nPress Enter to install all, or specify numbers/ranges to SKIP (e.g. 1 3 5-7), 'a' to skip all: ", .{});
+    const choice = try promptLine(allocator, "");
+    defer allocator.free(choice);
+
+    var skip_flags = try allocator.alloc(bool, pending_upgrades.items.len);
+    defer allocator.free(skip_flags);
+    @memset(skip_flags, false);
+
+    if (choice.len > 0) {
+        if (std.ascii.eqlIgnoreCase(choice, "a") or std.ascii.eqlIgnoreCase(choice, "all")) {
+            @memset(skip_flags, true);
+        } else {
+            var tok = std.mem.tokenizeAny(u8, choice, ", \t");
+            while (tok.next()) |part| {
+                if (std.mem.indexOfScalar(u8, part, '-')) |dash| {
+                    if (dash > 0 and dash + 1 < part.len) {
+                        const start = std.fmt.parseInt(usize, part[0..dash], 10) catch 0;
+                        const end = std.fmt.parseInt(usize, part[dash + 1 ..], 10) catch 0;
+                        if (start > 0 and end > 0 and start <= pending_upgrades.items.len and end <= pending_upgrades.items.len) {
+                            var s = start;
+                            var e = end;
+                            if (s > e) std.mem.swap(usize, &s, &e);
+                            var idx = s;
+                            while (idx <= e) : (idx += 1) {
+                                skip_flags[idx - 1] = true;
+                            }
+                        }
+                    }
+                } else if (std.fmt.parseInt(usize, part, 10)) |idx| {
+                    if (idx > 0 and idx <= pending_upgrades.items.len) {
+                        skip_flags[idx - 1] = true;
+                    }
+                } else |_| {}
+            }
+        }
+    }
+
+    var upgraded: usize = 0;
+    for (pending_upgrades.items, 0..) |upg, i| {
+        if (skip_flags[i]) continue;
+        sectionFmt("upgrade aur/{s}", .{upg.base});
+        kv("package", upg.pkg);
+        kv("current", upg.current);
+        kv("latest", upg.latest);
+        installAurPackageRecursive(allocator, &ctx, upg.base, false) catch |err| {
+            errLineFmt("failed to upgrade {s}: {s}", .{upg.pkg, @errorName(err)});
+            continue;
+        };
+        upgraded += 1;
+    }
+
+    rule();
     kvInt("upgraded", upgraded);
 }
 

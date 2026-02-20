@@ -4,6 +4,9 @@
 _melon_packages() {
     local -a pkgs
     pkgs=(${(f)"$(pacman -Ssq "$1" 2>/dev/null | head -100)"})
+    if [[ -n "$1" ]]; then
+        pkgs+=(${(f)"$(curl -m 1 -s "https://aur.archlinux.org/rpc/v5/search/$1" | grep -o '\"Name\":\"[^\"]*\"' | cut -d'\"' -f4 | head -100 2>/dev/null)"})
+    fi
     _describe 'package' pkgs
 }
 
