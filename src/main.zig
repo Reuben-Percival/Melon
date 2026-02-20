@@ -1084,7 +1084,6 @@ fn showSignatureSummary(allocator: Allocator, build_dir: []const u8) !void {
     ui.rule();
 }
 
-
 const AurInfo = struct {
     parsed: std.json.Parsed(std.json.Value),
     entry: ?std.json.Value,
@@ -1380,4 +1379,3 @@ fn printInstallSummary(summary: InstallSummary) void {
     }
     ui.rule();
 }
-
