@@ -144,13 +144,13 @@ fn installWithCompatibility(allocator: Allocator, raw_args: []const []const u8) 
     defer allocator.free(split.options);
     defer allocator.free(split.targets);
 
-    var effective_options = std.ArrayList([]const u8).empty;
+    var effective_options = std.ArrayListUnmanaged([]const u8){};
     defer effective_options.deinit(allocator);
-    var effective_targets = std.ArrayList([]const u8).empty;
+    var effective_targets = std.ArrayListUnmanaged([]const u8){};
     defer effective_targets.deinit(allocator);
     try effective_targets.appendSlice(allocator, split.targets);
 
-    var owned_file_targets = std.ArrayList([]const u8).empty;
+    var owned_file_targets = std.ArrayListUnmanaged([]const u8){};
     defer {
         for (owned_file_targets.items) |item| allocator.free(item);
         owned_file_targets.deinit(allocator);
@@ -358,7 +358,7 @@ fn searchPackages(allocator: Allocator, query: []const u8) !void {
     }
 
     var shown: usize = 0;
-    var aur_results = std.ArrayList(AurSearchResult).empty;
+    var aur_results = std.ArrayListUnmanaged(AurSearchResult){};
     defer aur_results.deinit(allocator);
     for (results.items) |entry| {
         if (entry != .object) continue;
@@ -442,7 +442,7 @@ fn selectAurPackagesByNumber(allocator: Allocator, raw: []const u8, aur_results:
     defer allocator.free(picked);
     @memset(picked, false);
 
-    var selected = std.ArrayList([]const u8).empty;
+    var selected = std.ArrayListUnmanaged([]const u8){};
     errdefer {
         for (selected.items) |name| allocator.free(name);
         selected.deinit(allocator);
@@ -517,8 +517,8 @@ fn selectAurPackagesByNumber(allocator: Allocator, raw: []const u8, aur_results:
 
 fn appendTargetsFromFile(
     allocator: Allocator,
-    effective_targets: *std.ArrayList([]const u8),
-    owned_file_targets: *std.ArrayList([]const u8),
+    effective_targets: *std.ArrayListUnmanaged([]const u8),
+    owned_file_targets: *std.ArrayListUnmanaged([]const u8),
     path: []const u8,
 ) !void {
     const data = try std.fs.cwd().readFileAlloc(allocator, path, 8 * 1024 * 1024);
@@ -547,7 +547,7 @@ fn indexOfAurResultByName(aur_results: []const AurSearchResult, name: []const u8
 }
 
 fn selectAllAurPackages(allocator: Allocator, aur_results: []const AurSearchResult) ![]const []const u8 {
-    var selected = std.ArrayList([]const u8).empty;
+    var selected = std.ArrayListUnmanaged([]const u8){};
     errdefer {
         for (selected.items) |name| allocator.free(name);
         selected.deinit(allocator);
@@ -589,7 +589,7 @@ fn selectAurPackagesWithFzf(allocator: Allocator, aur_results: []const AurSearch
     };
     defer allocator.free(out);
 
-    var selected = std.ArrayList([]const u8).empty;
+    var selected = std.ArrayListUnmanaged([]const u8){};
     errdefer {
         for (selected.items) |name| allocator.free(name);
         selected.deinit(allocator);
@@ -672,7 +672,7 @@ fn aurUpgrade(allocator: Allocator) !void {
         latest: []const u8,
     };
 
-    var pending_upgrades = std.ArrayList(PendingUpgrade).empty;
+    var pending_upgrades = std.ArrayListUnmanaged(PendingUpgrade){};
     defer {
         for (pending_upgrades.items) |u| {
             allocator.free(u.base);
