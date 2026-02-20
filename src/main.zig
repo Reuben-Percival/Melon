@@ -1,19 +1,14 @@
 const std = @import("std");
+const ui = @import("ui.zig");
 
 const Allocator = std.mem.Allocator;
-
-const color_reset = "\x1b[0m";
-const color_title = "\x1b[1;36m";
-const color_ok = "\x1b[1;32m";
-const color_warn = "\x1b[1;33m";
-const color_err = "\x1b[1;31m";
-const color_dim = "\x1b[2m";
 
 const InstallContext = struct {
     allocator: Allocator,
     installed_aur: std.StringHashMap(void),
     visiting_aur: std.StringHashMap(void),
     reviewed_aur: std.StringHashMap(void),
+    security_checked_aur: std.StringHashMap(void),
     skip_remaining_reviews: bool,
 
     fn init(allocator: Allocator) InstallContext {
@@ -22,6 +17,7 @@ const InstallContext = struct {
             .installed_aur = std.StringHashMap(void).init(allocator),
             .visiting_aur = std.StringHashMap(void).init(allocator),
             .reviewed_aur = std.StringHashMap(void).init(allocator),
+            .security_checked_aur = std.StringHashMap(void).init(allocator),
             .skip_remaining_reviews = false,
         };
     }
@@ -30,9 +26,11 @@ const InstallContext = struct {
         freeStringSetKeys(self.allocator, &self.installed_aur);
         freeStringSetKeys(self.allocator, &self.visiting_aur);
         freeStringSetKeys(self.allocator, &self.reviewed_aur);
+        freeStringSetKeys(self.allocator, &self.security_checked_aur);
         self.installed_aur.deinit();
         self.visiting_aur.deinit();
         self.reviewed_aur.deinit();
+        self.security_checked_aur.deinit();
     }
 };
 
@@ -66,6 +64,10 @@ pub fn main() !void {
 
     const args = try std.process.argsAlloc(allocator);
     defer std.process.argsFree(allocator, args);
+
+    // Initialize UI with default color mode (auto)
+    // TODO: Parse --color flag before this or handle it in parsing.zig
+    ui.init(.auto);
 
     if (args.len < 2 or eql(args[1], "-h") or eql(args[1], "--help")) {
         printUsage();
@@ -115,7 +117,7 @@ pub fn main() !void {
 }
 
 fn printUsage() void {
-    title("melon");
+    ui.title("melon");
     std.debug.print(
         \\  AUR helper in Zig
         \\
@@ -134,7 +136,7 @@ fn printUsage() void {
 }
 
 fn usageErr(msg: []const u8) !void {
-    errLine(msg);
+    ui.errLine(msg);
     printUsage();
     return error.InvalidArguments;
 }
@@ -171,7 +173,7 @@ fn installWithCompatibility(allocator: Allocator, raw_args: []const []const u8) 
     }
 
     if (effective_targets.items.len == 0) {
-        section("pacman -S passthrough (no explicit targets)");
+        ui.section("pacman -S passthrough (no explicit targets)");
         var pac_args = try allocator.alloc([]const u8, 1 + effective_options.items.len);
         defer allocator.free(pac_args);
         pac_args[0] = "-S";
@@ -213,7 +215,7 @@ fn installWithCompatibility(allocator: Allocator, raw_args: []const []const u8) 
     }
 
     if (official_targets.len > 0) {
-        section("install official targets");
+        ui.section("install official targets");
         installOfficialTargets(allocator, effective_options.items, official_targets) catch |err| {
             summary.failures += 1;
             if (summary.failed_target == null) summary.failed_target = "official-repos";
@@ -224,7 +226,7 @@ fn installWithCompatibility(allocator: Allocator, raw_args: []const []const u8) 
 
     if (aur_targets.len == 0) return;
 
-    section("install AUR targets");
+    ui.section("install AUR targets");
     var ctx = InstallContext.init(allocator);
     defer ctx.deinit();
     for (aur_targets) |pkg| {
@@ -232,14 +234,14 @@ fn installWithCompatibility(allocator: Allocator, raw_args: []const []const u8) 
             summary.skipped_installed += 1;
             continue;
         }
-        warnLineFmt("using AUR for: {s}", .{pkg});
+        ui.warnLineFmt("using AUR for: {s}", .{pkg});
         installAurPackageRecursive(allocator, &ctx, pkg, false) catch |err| {
             summary.failures += 1;
             if (summary.failed_target == null) summary.failed_target = pkg;
             return err;
         };
         summary.aur_installed += 1;
-        okLineFmt("AUR install complete: {s}", .{pkg});
+        ui.okLineFmt("AUR install complete: {s}", .{pkg});
     }
 }
 
@@ -325,16 +327,16 @@ fn installOfficialTargets(allocator: Allocator, options: []const []const u8, tar
 }
 
 fn searchPackages(allocator: Allocator, query: []const u8) !void {
-    title("Search");
-    kv("query", query);
-    rule();
-    section("official repositories");
+    ui.title("Search");
+    ui.kv("query", query);
+    ui.rule();
+    ui.section("official repositories");
     _ = runStreaming(allocator, &.{ "pacman", "-Ss", query }) catch |err| {
-        warnLineFmt("pacman search failed: {s}", .{@errorName(err)});
+        ui.warnLineFmt("pacman search failed: {s}", .{@errorName(err)});
         return;
     };
 
-    section("AUR");
+    ui.section("AUR");
     const enc = try urlEncode(allocator, query);
     defer allocator.free(enc);
 
@@ -348,12 +350,12 @@ fn searchPackages(allocator: Allocator, query: []const u8) !void {
     defer parsed.deinit();
 
     const results = getArray(parsed.value, "results") orelse {
-        warnLine("invalid AUR response");
+        ui.warnLine("invalid AUR response");
         return;
     };
 
     if (results.items.len == 0) {
-        warnLine("no AUR results");
+        ui.warnLine("no AUR results");
         return;
     }
 
@@ -371,8 +373,8 @@ fn searchPackages(allocator: Allocator, query: []const u8) !void {
             .desc = try allocator.dupe(u8, desc),
         });
         shown += 1;
-        std.debug.print("{s}[{d: >2}]{s} aur/{s} {s}\n", .{ color_title, shown, color_reset, name, version });
-        if (desc.len > 0) std.debug.print("     {s}{s}{s}\n", .{ color_dim, desc, color_reset });
+        ui.printPackageHeader("aur", name, version, shown);
+        ui.printDescription(desc);
     }
     defer {
         for (aur_results.items) |item| {
@@ -381,8 +383,8 @@ fn searchPackages(allocator: Allocator, query: []const u8) !void {
             allocator.free(item.desc);
         }
     }
-    rule();
-    kvInt("aur results", shown);
+    ui.rule();
+    ui.kvInt("aur results", shown);
     try maybeHandleSearchSelection(allocator, aur_results.items);
 }
 
@@ -397,7 +399,7 @@ fn maybeHandleSearchSelection(allocator: Allocator, aur_results: []const AurSear
     std.debug.print("  - Press Enter to skip\n", .{});
 
     while (true) {
-        const choice = try promptLine(allocator, "Select packages: ");
+        const choice = try ui.promptLine(allocator, "Select packages: ");
         defer allocator.free(choice);
         if (choice.len == 0 or std.ascii.eqlIgnoreCase(choice, "n") or std.ascii.eqlIgnoreCase(choice, "none")) return;
 
@@ -409,14 +411,14 @@ fn maybeHandleSearchSelection(allocator: Allocator, aur_results: []const AurSear
                 break :blk try selectAurPackagesWithFzf(allocator, aur_results);
             }
             break :blk selectAurPackagesByNumber(allocator, choice, aur_results) catch {
-                warnLine("invalid selection; use numbers/ranges like '1 3 5-7', or 'a', or 'f'");
+                ui.warnLine("invalid selection; use numbers/ranges like '1 3 5-7', or 'a', or 'f'");
                 continue;
             };
         };
         defer freeNameList(allocator, selected);
 
         if (selected.len == 0) {
-            warnLine("no packages selected");
+            ui.warnLine("no packages selected");
             continue;
         }
 
@@ -424,14 +426,14 @@ fn maybeHandleSearchSelection(allocator: Allocator, aur_results: []const AurSear
         for (selected) |pkg| {
             std.debug.print("  - {s}\n", .{pkg});
         }
-        const confirm = try promptLine(allocator, "Proceed with install? [Y/n]: ");
+        const confirm = try ui.promptLine(allocator, "Proceed with install? [Y/n]: ");
         defer allocator.free(confirm);
         if (!(confirm.len == 0 or std.ascii.eqlIgnoreCase(confirm, "y") or std.ascii.eqlIgnoreCase(confirm, "yes"))) {
-            warnLine("selection canceled");
+            ui.warnLine("selection canceled");
             return;
         }
 
-        section("install selected AUR packages");
+        ui.section("install selected AUR packages");
         try installWithCompatibility(allocator, selected);
         return;
     }
@@ -456,7 +458,7 @@ fn selectAurPackagesByNumber(allocator: Allocator, raw: []const u8, aur_results:
             select_value = false;
             token = token[1..];
             if (token.len == 0) {
-                errLineFmt("invalid selection token: {s}", .{part});
+                ui.errLineFmt("invalid selection token: {s}", .{part});
                 return error.InvalidArguments;
             }
         }
@@ -468,19 +470,19 @@ fn selectAurPackagesByNumber(allocator: Allocator, raw: []const u8, aur_results:
 
         if (std.mem.indexOfScalar(u8, token, '-')) |dash| {
             if (dash == 0 or dash + 1 >= part.len) {
-                errLineFmt("invalid range token: {s}", .{part});
+                ui.errLineFmt("invalid range token: {s}", .{part});
                 return error.InvalidArguments;
             }
             var start = std.fmt.parseInt(usize, token[0..dash], 10) catch {
-                errLineFmt("invalid range token: {s}", .{part});
+                ui.errLineFmt("invalid range token: {s}", .{part});
                 return error.InvalidArguments;
             };
             var end = std.fmt.parseInt(usize, token[dash + 1 ..], 10) catch {
-                errLineFmt("invalid range token: {s}", .{part});
+                ui.errLineFmt("invalid range token: {s}", .{part});
                 return error.InvalidArguments;
             };
             if (start == 0 or end == 0 or start > aur_results.len or end > aur_results.len) {
-                errLineFmt("selection range out of bounds: {s}", .{part});
+                ui.errLineFmt("selection range out of bounds: {s}", .{part});
                 return error.InvalidArguments;
             }
             if (start > end) std.mem.swap(usize, &start, &end);
@@ -493,7 +495,7 @@ fn selectAurPackagesByNumber(allocator: Allocator, raw: []const u8, aur_results:
 
         if (std.fmt.parseInt(usize, token, 10)) |idx| {
             if (idx == 0 or idx > aur_results.len) {
-                errLineFmt("selection out of range: {d}", .{idx});
+                ui.errLineFmt("selection out of range: {d}", .{idx});
                 return error.InvalidArguments;
             }
             picked[idx - 1] = select_value;
@@ -501,7 +503,7 @@ fn selectAurPackagesByNumber(allocator: Allocator, raw: []const u8, aur_results:
         } else |_| {}
 
         const name_idx = indexOfAurResultByName(aur_results, token) orelse {
-            errLineFmt("unknown package in selection: {s}", .{token});
+            ui.errLineFmt("unknown package in selection: {s}", .{token});
             return error.InvalidArguments;
         };
         picked[name_idx] = select_value;
@@ -561,7 +563,7 @@ fn selectAllAurPackages(allocator: Allocator, aur_results: []const AurSearchResu
 fn selectAurPackagesWithFzf(allocator: Allocator, aur_results: []const AurSearchResult) ![]const []const u8 {
     const fzf_ok = runStatus(allocator, null, &.{ "fzf", "--version" }) catch 1;
     if (fzf_ok != 0) {
-        warnLine("fzf not found; use numeric selection or install fzf");
+        ui.warnLine("fzf not found; use numeric selection or install fzf");
         return allocator.alloc([]const u8, 0);
     }
 
@@ -609,46 +611,46 @@ fn selectAurPackagesWithFzf(allocator: Allocator, aur_results: []const AurSearch
 }
 
 fn infoPackage(allocator: Allocator, pkg: []const u8) !void {
-    title("Info");
+    ui.title("Info");
     const official_ok = blk: {
         const rc = runStreaming(allocator, &.{ "pacman", "-Si", pkg }) catch break :blk false;
         break :blk rc == 0;
     };
     if (official_ok) return;
 
-    section("AUR fallback");
+    ui.section("AUR fallback");
     const info = try fetchAurInfo(allocator, pkg);
     defer info.parsed.deinit();
 
     if (info.entry == null) {
-        errLineFmt("package '{s}' not found in AUR", .{pkg});
+        ui.errLineFmt("package '{s}' not found in AUR", .{pkg});
         return error.NotFound;
     }
     const entry = info.entry.?;
 
-    rule();
-    kv("Repository", "aur");
-    kv("Name", getString(entry, "Name") orelse "<unknown>");
-    kv("Version", getString(entry, "Version") orelse "<unknown>");
-    kv("Description", getString(entry, "Description") orelse "");
-    kv("URL", getString(entry, "URL") orelse "");
-    kv("Maintainer", getString(entry, "Maintainer") orelse "<orphan>");
-    rule();
+    ui.rule();
+    ui.kv("Repository", "aur");
+    ui.kv("Name", getString(entry, "Name") orelse "<unknown>");
+    ui.kv("Version", getString(entry, "Version") orelse "<unknown>");
+    ui.kv("Description", getString(entry, "Description") orelse "");
+    ui.kv("URL", getString(entry, "URL") orelse "");
+    ui.kv("Maintainer", getString(entry, "Maintainer") orelse "<orphan>");
+    ui.rule();
 }
 
 fn systemUpgrade(allocator: Allocator) !void {
-    title("Upgrade");
-    section("system packages");
+    ui.title("Upgrade");
+    ui.section("system packages");
     const sync_rc = try runPacmanSudo(allocator, &.{"-Syu"});
     if (sync_rc != 0) return error.PacmanUpgradeFailed;
-    okLine("system packages are up to date");
+    ui.okLine("system packages are up to date");
 
-    section("AUR packages");
+    ui.section("AUR packages");
     try aurUpgrade(allocator);
 }
 
 fn aurUpgrade(allocator: Allocator) !void {
-    title("AUR upgrade");
+    ui.title("AUR upgrade");
     var ctx = InstallContext.init(allocator);
     defer ctx.deinit();
     var seen_bases = std.StringHashMap(void).init(allocator);
@@ -661,7 +663,7 @@ fn aurUpgrade(allocator: Allocator) !void {
     defer freeNameList(allocator, aur_list);
 
     if (aur_list.len == 0) {
-        warnLine("no foreign packages found");
+        ui.warnLine("no foreign packages found");
         return;
     }
 
@@ -711,21 +713,21 @@ fn aurUpgrade(allocator: Allocator) !void {
         }
     }
 
-    rule();
-    kvInt("scanned", scanned);
+    ui.rule();
+    ui.kvInt("scanned", scanned);
 
     if (pending_upgrades.items.len == 0) {
-        okLine("AUR packages are up to date");
+        ui.okLine("AUR packages are up to date");
         return;
     }
 
-    std.debug.print("{s}AUR Updates:{s}\n", .{ color_title, color_reset });
+    ui.title("AUR Updates");
     for (pending_upgrades.items, 0..) |upg, i| {
-        std.debug.print("  {s}[{d}]{s} {s} ({s} -> {s})\n", .{ color_title, i + 1, color_reset, upg.pkg, upg.current, upg.latest });
+        std.debug.print("  {s}[{d}]{s} {s} ({s} -> {s})\n", .{ "\x1b[1;36m", i + 1, "\x1b[0m", upg.pkg, upg.current, upg.latest });
     }
 
     std.debug.print("\nPress Enter to install all, or specify numbers/ranges to SKIP (e.g. 1 3 5-7), 'a' to skip all: ", .{});
-    const choice = try promptLine(allocator, "");
+    const choice = try ui.promptLine(allocator, "");
     defer allocator.free(choice);
 
     var skip_flags = try allocator.alloc(bool, pending_upgrades.items.len);
@@ -764,23 +766,23 @@ fn aurUpgrade(allocator: Allocator) !void {
     var upgraded: usize = 0;
     for (pending_upgrades.items, 0..) |upg, i| {
         if (skip_flags[i]) continue;
-        sectionFmt("upgrade aur/{s}", .{upg.base});
-        kv("package", upg.pkg);
-        kv("current", upg.current);
-        kv("latest", upg.latest);
+        ui.sectionFmt("upgrade aur/{s}", .{upg.base});
+        ui.kv("package", upg.pkg);
+        ui.kv("current", upg.current);
+        ui.kv("latest", upg.latest);
         installAurPackageRecursive(allocator, &ctx, upg.base, false) catch |err| {
-            errLineFmt("failed to upgrade {s}: {s}", .{ upg.pkg, @errorName(err) });
+            ui.errLineFmt("failed to upgrade {s}: {s}", .{ upg.pkg, @errorName(err) });
             continue;
         };
         upgraded += 1;
     }
 
-    rule();
-    kvInt("upgraded", upgraded);
+    ui.rule();
+    ui.kvInt("upgraded", upgraded);
 }
 
 fn foreignPackages(allocator: Allocator) !void {
-    title("Foreign packages (-Qm)");
+    ui.title("Foreign packages (-Qm)");
     _ = try runStreaming(allocator, &.{ "pacman", "-Qm" });
 }
 
@@ -788,14 +790,14 @@ fn installAurPackageRecursive(allocator: Allocator, ctx: *InstallContext, pkg: [
     if (skip_if_installed and (try isInstalledPackage(allocator, pkg))) return;
 
     const repo_base = (try resolveAurPackageBase(allocator, pkg)) orelse {
-        errLineFmt("package '{s}' not found in AUR", .{pkg});
+        ui.errLineFmt("package '{s}' not found in AUR", .{pkg});
         return error.NotFound;
     };
     defer allocator.free(repo_base);
 
     if (ctx.installed_aur.contains(repo_base)) return;
     if (ctx.visiting_aur.contains(repo_base)) {
-        errLineFmt("dependency cycle detected at aur/{s}", .{repo_base});
+        ui.errLineFmt("dependency cycle detected at aur/{s}", .{repo_base});
         return error.DependencyCycle;
     }
     try ctx.visiting_aur.put(try ctx.allocator.dupe(u8, repo_base), {});
@@ -843,13 +845,13 @@ fn ensureDependencyInstalled(allocator: Allocator, ctx: *InstallContext, dep: []
     if (try isDependencySatisfied(allocator, dep)) return;
 
     if (try isOfficialPackage(allocator, dep)) {
-        sectionFmt("install dependency from repos: {s}", .{dep});
+        ui.sectionFmt("install dependency from repos: {s}", .{dep});
         const rc = try runPacmanSudo(allocator, &.{ "-S", "--needed", dep });
         if (rc != 0) return error.DependencyInstallFailed;
         return;
     }
 
-    sectionFmt("install dependency from AUR: {s}", .{dep});
+    ui.sectionFmt("install dependency from AUR: {s}", .{dep});
     try installAurPackageRecursive(allocator, ctx, dep, true);
 }
 
@@ -884,20 +886,25 @@ fn reviewAurPackage(allocator: Allocator, ctx: *InstallContext, build_dir: []con
 
     try writeSrcinfoFile(allocator, build_dir, srcinfo);
 
-    title("AUR review");
-    kv("package", pkg);
-    kv("repo", repo_base);
-    kv("path", build_dir);
+    ui.title("AUR review");
+    ui.kv("package", pkg);
+    ui.kv("repo", repo_base);
+    ui.kv("path", build_dir);
     std.debug.print("\n", .{});
     std.debug.print("  1) View PKGBUILD\n", .{});
     std.debug.print("  2) View dependency summary\n", .{});
     std.debug.print("  3) View full .SRCINFO\n", .{});
+    std.debug.print("  4) View source diff (since last review)\n", .{});
+    std.debug.print("  5) Run PKGBUILD security check\n", .{});
+    std.debug.print("  6) View source/checksum summary\n", .{});
     std.debug.print("  c) Continue build\n", .{});
-    std.debug.print("  a) Continue and trust all for this run\n", .{});
+    std.debug.print("  a) Continue and trust remaining for this run\n", .{});
     std.debug.print("  q) Abort\n", .{});
 
+    var security_passed = ctx.security_checked_aur.contains(repo_base);
+
     while (true) {
-        const choice = try promptLine(allocator, "Choose [1/2/3/c/a/q]: ");
+        const choice = try ui.promptLine(allocator, "Choose [1-6/c/a/q]: ");
         defer allocator.free(choice);
         if (eql(choice, "1")) {
             try showFileForReview(allocator, build_dir, "PKGBUILD");
@@ -913,11 +920,35 @@ fn reviewAurPackage(allocator: Allocator, ctx: *InstallContext, build_dir: []con
             try showFileForReview(allocator, build_dir, ".SRCINFO");
             continue;
         }
+        if (eql(choice, "4")) {
+            ui.section("git diff --word-diff PKGBUILD");
+            _ = runStreamingCwd(allocator, build_dir, &.{ "git", "diff", "--word-diff", "PKGBUILD" }) catch {};
+            continue;
+        }
+        if (eql(choice, "5")) {
+            security_passed = try checkPkgbuildSecurity(allocator, build_dir);
+            if (security_passed) {
+                try ctx.security_checked_aur.put(try ctx.allocator.dupe(u8, repo_base), {});
+            }
+            continue;
+        }
+        if (eql(choice, "6")) {
+            try showSignatureSummary(allocator, build_dir);
+            continue;
+        }
         if (eql(choice, "c")) {
+            if (!security_passed) {
+                ui.warnLine("Security check (5) is mandatory before continuing.");
+                continue;
+            }
             try ctx.reviewed_aur.put(try ctx.allocator.dupe(u8, repo_base), {});
             return;
         }
         if (eql(choice, "a")) {
+            if (!security_passed) {
+                ui.warnLine("Security check (5) is mandatory before trusting all.");
+                continue;
+            }
             ctx.skip_remaining_reviews = true;
             try ctx.reviewed_aur.put(try ctx.allocator.dupe(u8, repo_base), {});
             return;
@@ -925,7 +956,7 @@ fn reviewAurPackage(allocator: Allocator, ctx: *InstallContext, build_dir: []con
         if (eql(choice, "q")) {
             return error.PkgbuildRejected;
         }
-        warnLine("invalid choice");
+        ui.warnLine("invalid choice");
     }
 }
 
@@ -943,13 +974,25 @@ fn writeSrcinfoFile(allocator: Allocator, build_dir: []const u8, srcinfo: []cons
 fn showFileForReview(allocator: Allocator, build_dir: []const u8, file_name: []const u8) !void {
     const pager_rc = runStreamingCwd(allocator, build_dir, &.{ "less", "-R", file_name }) catch 1;
     if (pager_rc == 0) return;
-    const cat_rc = runStreamingCwd(allocator, build_dir, &.{ "cat", file_name }) catch 1;
-    if (cat_rc != 0) return error.PkgbuildReadFailed;
+
+    // Fallback cat with highlighting
+    const path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ build_dir, file_name });
+    defer allocator.free(path);
+
+    const data = try std.fs.cwd().readFileAlloc(allocator, path, 1024 * 1024);
+    defer allocator.free(data);
+
+    var it = std.mem.splitScalar(u8, data, '\n');
+    while (it.next()) |line| {
+        const highlighted = try ui.highlightBash(allocator, line);
+        defer allocator.free(highlighted);
+        std.debug.print("{s}\n", .{highlighted});
+    }
 }
 
 fn printDependencyLines(srcinfo: []const u8) !void {
-    std.debug.print("{s}Dependencies{s}\n", .{ color_title, color_reset });
-    rule();
+    std.debug.print("{s}Dependencies{s}\n", .{ "\x1b[1;36m", "\x1b[0m" });
+    ui.rule();
     var it = std.mem.splitScalar(u8, srcinfo, '\n');
     var found = false;
     while (it.next()) |line| {
@@ -965,17 +1008,82 @@ fn printDependencyLines(srcinfo: []const u8) !void {
         }
     }
     if (!found) std.debug.print("  - (none declared)\n", .{});
-    rule();
+    ui.rule();
 }
 
-fn promptLine(allocator: Allocator, prompt: []const u8) ![]u8 {
-    std.debug.print("{s}", .{prompt});
-    var line_buf: [256]u8 = undefined;
-    const line_opt = try std.fs.File.stdin().deprecatedReader().readUntilDelimiterOrEof(line_buf[0..], '\n');
-    const line = line_opt orelse return allocator.dupe(u8, "");
-    const trimmed = std.mem.trim(u8, line, " \t\r\n");
-    return allocator.dupe(u8, trimmed);
+fn checkPkgbuildSecurity(allocator: Allocator, build_dir: []const u8) !bool {
+    ui.section("Security check");
+    const path = try std.fmt.allocPrint(allocator, "{s}/PKGBUILD", .{build_dir});
+    defer allocator.free(path);
+
+    const data = std.fs.cwd().readFileAlloc(allocator, path, 1024 * 1024) catch {
+        ui.errLine("failed to read PKGBUILD for security check");
+        return false;
+    };
+    defer allocator.free(data);
+
+    var risky_count: usize = 0;
+    var line_idx: usize = 0;
+    var it = std.mem.splitScalar(u8, data, '\n');
+
+    const patterns = [_]struct { pat: []const u8, msg: []const u8 }{
+        .{ .pat = "sudo ", .msg = "use of sudo inside build script" },
+        .{ .pat = "curl ", .msg = "network fetch during build" },
+        .{ .pat = "wget ", .msg = "network fetch during build" },
+        .{ .pat = "| sh", .msg = "piping into shell (potential RCE)" },
+        .{ .pat = "rm -rf /", .msg = "extremely dangerous removal" },
+        .{ .pat = "rm -rf $", .msg = "risky recursive removal with variable" },
+        .{ .pat = "insmod", .msg = "kernel module insertion" },
+        .{ .pat = "modprobe", .msg = "kernel module insertion" },
+        .{ .pat = "LD_PRELOAD", .msg = "library hijacking" },
+        .{ .pat = "!strip", .msg = "debug symbols retention (usually safe, but notable)" },
+        .{ .pat = "!check", .msg = "skipping build tests" },
+        .{ .pat = "!fortify", .msg = "disabling security hardening" },
+    };
+
+    while (it.next()) |line| {
+        line_idx += 1;
+        const trimmed = std.mem.trim(u8, line, " \t\r");
+        if (trimmed.len == 0 or trimmed[0] == '#') continue;
+
+        for (patterns) |p| {
+            if (std.mem.indexOf(u8, line, p.pat)) |_| {
+                ui.warnLineFmt("L{d}: {s} ('{s}')", .{ line_idx, p.msg, p.pat });
+                risky_count += 1;
+            }
+        }
+    }
+
+    if (risky_count > 0) {
+        ui.rule();
+        ui.warnLineFmt("Found {d} risky patterns. Please review carefully.", .{risky_count});
+        const confirm = try ui.promptLine(allocator, "Accept risky PKGBUILD? [y/N]: ");
+        defer allocator.free(confirm);
+        return (confirm.len > 0 and (std.ascii.eqlIgnoreCase(confirm, "y") or std.ascii.eqlIgnoreCase(confirm, "yes")));
+    } else {
+        ui.okLine("No obvious risky patterns found.");
+        return true;
+    }
 }
+
+fn showSignatureSummary(allocator: Allocator, build_dir: []const u8) !void {
+    ui.section("Source & Checksum summary");
+    const path = try std.fmt.allocPrint(allocator, "{s}/.SRCINFO", .{build_dir});
+    defer allocator.free(path);
+
+    const data = try std.fs.cwd().readFileAlloc(allocator, path, 1024 * 1024);
+    defer allocator.free(data);
+
+    var it = std.mem.splitScalar(u8, data, '\n');
+    while (it.next()) |line| {
+        const trimmed = std.mem.trim(u8, line, " \t\r");
+        if (startsWithAny(trimmed, &.{ "source = ", "sha256sums = ", "validpgpkeys = ", "md5sums = " })) {
+            std.debug.print("  {s}\n", .{trimmed});
+        }
+    }
+    ui.rule();
+}
+
 
 const AurInfo = struct {
     parsed: std.json.Parsed(std.json.Value),
@@ -1058,7 +1166,7 @@ fn fetchUrl(allocator: Allocator, url: []const u8) ![]u8 {
 
 fn generateSrcinfo(allocator: Allocator, build_dir: []const u8, pkg: []const u8) ![]u8 {
     return runCaptureCwd(allocator, build_dir, &.{ "makepkg", "--printsrcinfo" }) catch |err| {
-        errLineFmt("failed to generate .SRCINFO for aur/{s}: {s}", .{ pkg, @errorName(err) });
+        ui.errLineFmt("failed to generate .SRCINFO for aur/{s}: {s}", .{ pkg, @errorName(err) });
         return error.SrcInfoFailed;
     };
 }
@@ -1252,15 +1360,15 @@ fn printInstallSummary(summary: InstallSummary) void {
     const elapsed_ns = std.time.nanoTimestamp() - summary.started_ns;
     const elapsed_ms: i128 = @divFloor(elapsed_ns, std.time.ns_per_ms);
 
-    std.debug.print("\n{s}Install summary{s}\n", .{ color_ok, color_reset });
-    rule();
-    kvInt("requested", summary.requested_targets);
-    kvInt("official targets", summary.official_targets);
-    kvInt("aur targets", summary.aur_targets);
-    kvInt("official done", summary.official_installed);
-    kvInt("aur done", summary.aur_installed);
-    kvInt("skipped", summary.skipped_installed);
-    kvInt("failures", summary.failures);
+    std.debug.print("\n{s}Install summary{s}\n", .{ "\x1b[1;32m", "\x1b[0m" });
+    ui.rule();
+    ui.kvInt("requested", summary.requested_targets);
+    ui.kvInt("official targets", summary.official_targets);
+    ui.kvInt("aur targets", summary.aur_targets);
+    ui.kvInt("official done", summary.official_installed);
+    ui.kvInt("aur done", summary.aur_installed);
+    ui.kvInt("skipped", summary.skipped_installed);
+    ui.kvInt("failures", summary.failures);
     std.debug.print("  {s: <14} : {d}\n", .{ "elapsed ms", elapsed_ms });
     if (summary.failed_target) |target| {
         std.debug.print("  {s: <14} : melon -S {s}\n", .{ "retry", target });
@@ -1270,61 +1378,6 @@ fn printInstallSummary(summary: InstallSummary) void {
     } else if (summary.requested_targets > 0) {
         std.debug.print("  {s: <14} : melon -Qm\n", .{"next"});
     }
-    rule();
+    ui.rule();
 }
 
-fn title(msg: []const u8) void {
-    std.debug.print("\n{s}==> {s}{s}\n", .{ color_title, msg, color_reset });
-}
-
-fn section(msg: []const u8) void {
-    std.debug.print("{s}:: {s}{s}\n", .{ color_dim, msg, color_reset });
-}
-
-fn sectionFmt(comptime fmt: []const u8, args: anytype) void {
-    std.debug.print("{s}:: ", .{color_dim});
-    std.debug.print(fmt, args);
-    std.debug.print("{s}\n", .{color_reset});
-}
-
-fn rule() void {
-    std.debug.print("{s}----------------------------------------{s}\n", .{ color_dim, color_reset });
-}
-
-fn kv(key: []const u8, value: []const u8) void {
-    std.debug.print("  {s: <14} : {s}\n", .{ key, value });
-}
-
-fn kvInt(key: []const u8, value: usize) void {
-    std.debug.print("  {s: <14} : {d}\n", .{ key, value });
-}
-
-fn okLine(msg: []const u8) void {
-    std.debug.print("{s}[ok]{s} {s}\n", .{ color_ok, color_reset, msg });
-}
-
-fn okLineFmt(comptime fmt: []const u8, args: anytype) void {
-    std.debug.print("{s}[ok]{s} ", .{ color_ok, color_reset });
-    std.debug.print(fmt, args);
-    std.debug.print("\n", .{});
-}
-
-fn warnLine(msg: []const u8) void {
-    std.debug.print("{s}[warn]{s} {s}\n", .{ color_warn, color_reset, msg });
-}
-
-fn warnLineFmt(comptime fmt: []const u8, args: anytype) void {
-    std.debug.print("{s}[warn]{s} ", .{ color_warn, color_reset });
-    std.debug.print(fmt, args);
-    std.debug.print("\n", .{});
-}
-
-fn errLine(msg: []const u8) void {
-    std.debug.print("{s}[error]{s} {s}\n", .{ color_err, color_reset, msg });
-}
-
-fn errLineFmt(comptime fmt: []const u8, args: anytype) void {
-    std.debug.print("{s}[error]{s} ", .{ color_err, color_reset });
-    std.debug.print(fmt, args);
-    std.debug.print("\n", .{});
-}
